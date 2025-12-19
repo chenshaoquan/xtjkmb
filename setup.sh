@@ -1,62 +1,67 @@
 #!/bin/bash
 
 # System Monitor Web Dashboard - 一键安装脚本
-# 使用方法: curl -fsSL https://raw.githubusercontent.com/YOUR_USERNAME/system-monitor/main/setup.sh | sudo bash
-
-set -e
-
-echo "=========================================="
-echo "  System Monitor Web Dashboard 安装程序"
-echo "=========================================="
-echo ""
+# 使用方法: curl -fsSL https://raw.githubusercontent.com/chenshaoquan/xtjkmb/main/setup.sh | sudo bash
 
 # 检查是否为root用户
 if [ "$EUID" -ne 0 ]; then 
     echo "错误: 请使用root权限运行此脚本"
-    echo "使用: curl -fsSL URL | sudo bash"
     exit 1
 fi
 
 # 安装目录
 INSTALL_DIR="/opt/system-monitor"
 SERVICE_FILE="/etc/systemd/system/system-monitor.service"
+LOG_FILE="/tmp/system-monitor-install.log"
 
-echo "1. 检查依赖..."
-# 检查并安装必要的工具
-if ! command -v lsof &> /dev/null; then
-    echo "   安装 lsof..."
-    apt-get update -qq 2>&1 | grep -v "^$" || true
-    apt-get install -y lsof 2>&1 | grep -v "^$" || yum install -y lsof 2>&1 | grep -v "^$" || true
-fi
+# 清空日志
+> "$LOG_FILE"
 
-if ! command -v nc &> /dev/null; then
-    echo "   安装 netcat..."
-    apt-get install -y netcat 2>&1 | grep -v "^$" || yum install -y nc 2>&1 | grep -v "^$" || true
-fi
+# 进度显示函数
+show_progress() {
+    local current=$1
+    local total=$2
+    local msg=$3
+    local percent=$((current * 100 / total))
+    printf "\r[%3d%%] %s" "$percent" "$msg"
+}
 
-if ! command -v smartctl &> /dev/null; then
-    echo "   安装 smartmontools..."
-    apt-get install -y smartmontools 2>&1 | grep -v "^$" || yum install -y smartmontools 2>&1 | grep -v "^$" || true
-fi
+echo "=========================================="
+echo "  System Monitor 安装中..."
+echo "=========================================="
+echo ""
 
-echo "   ✓ 依赖检查完成"
+# 1. 检查依赖 (20%)
+show_progress 1 5 "检查系统依赖..."
+{
+    if ! command -v lsof &> /dev/null; then
+        apt-get update -qq >> "$LOG_FILE" 2>&1 || true
+        apt-get install -y lsof >> "$LOG_FILE" 2>&1 || yum install -y lsof >> "$LOG_FILE" 2>&1 || true
+    fi
+    
+    if ! command -v nc &> /dev/null; then
+        apt-get install -y netcat >> "$LOG_FILE" 2>&1 || yum install -y nc >> "$LOG_FILE" 2>&1 || true
+    fi
+    
+    if ! command -v smartctl &> /dev/null; then
+        apt-get install -y smartmontools >> "$LOG_FILE" 2>&1 || yum install -y smartmontools >> "$LOG_FILE" 2>&1 || true
+    fi
+} &
+wait $!
+echo ""
 
-# 停止旧服务（如果存在）
-if systemctl is-active --quiet system-monitor; then
-    echo "2. 停止旧服务..."
-    systemctl stop system-monitor
-    echo "   ✓ 旧服务已停止"
-else
-    echo "2. 未检测到运行中的服务"
-fi
+# 2. 停止旧服务 (40%)
+show_progress 2 5 "停止旧服务..."
+systemctl is-active --quiet system-monitor && systemctl stop system-monitor >> "$LOG_FILE" 2>&1 || true
+echo ""
 
-# 创建安装目录
-echo "3. 创建安装目录..."
-mkdir -p "$INSTALL_DIR"
-echo "   ✓ 目录创建完成: $INSTALL_DIR"
+# 3. 创建安装目录 (60%)
+show_progress 3 5 "创建安装目录..."
+mkdir -p "$INSTALL_DIR" >> "$LOG_FILE" 2>&1
+echo ""
 
-# 创建monitor.sh文件
-echo "4. 创建监控脚本..."
+# 4. 创建监控脚本 (80%)
+show_progress 4 5 "创建监控脚本..."
 cat > "$INSTALL_DIR/monitor.sh" << 'MONITOR_SCRIPT_EOF'
 #!/bin/sh
 
@@ -780,12 +785,13 @@ while true; do
 done
 MONITOR_SCRIPT_EOF
 
-chmod +x "$INSTALL_DIR/monitor.sh"
-echo "   ✓ 监控脚本创建完成"
+chmod +x "$INSTALL_DIR/monitor.sh" >> "$LOG_FILE" 2>&1
+echo ""
 
-# 创建systemd服务文件
-echo "5. 创建systemd服务..."
-cat > "$SERVICE_FILE" << 'EOF'
+# 5. 启动服务 (100%)
+show_progress 5 5 "启动服务..."
+{
+    cat > "$SERVICE_FILE" << 'EOF'
 [Unit]
 Description=System Monitor Web Dashboard
 After=network.target
@@ -803,49 +809,33 @@ StandardError=journal
 [Install]
 WantedBy=multi-user.target
 EOF
-echo "   ✓ 服务文件创建完成"
-
-# 重载systemd
-echo "6. 重载systemd配置..."
-systemctl daemon-reload
-echo "   ✓ systemd配置已重载"
-
-# 启用并启动服务
-echo "7. 启动服务..."
-systemctl enable system-monitor
-systemctl start system-monitor
-echo "   ✓ 服务已启动并设置为开机自启"
-
-# 等待服务启动
-sleep 2
+    systemctl daemon-reload >> "$LOG_FILE" 2>&1
+    systemctl enable system-monitor >> "$LOG_FILE" 2>&1
+    systemctl start system-monitor >> "$LOG_FILE" 2>&1
+    sleep 2
+} &
+wait $!
+echo ""
 
 # 检查服务状态
 if systemctl is-active --quiet system-monitor; then
     echo ""
     echo "=========================================="
-    echo "  ✓ 安装成功！"
+    echo "  ✓ 安装完成！"
     echo "=========================================="
     echo ""
-    echo "服务信息:"
-    echo "  - 服务名称: system-monitor"
-    echo "  - 安装目录: $INSTALL_DIR"
-    echo "  - 访问地址: http://$(hostname -I | awk '{print $1}'):8888"
-    echo "  - 本地访问: http://localhost:8888"
+    echo "访问地址: http://$(hostname -I | awk '{print $1}'):8888"
+    echo "本地访问: http://localhost:8888"
     echo ""
-    echo "常用命令:"
-    echo "  - 查看状态: systemctl status system-monitor"
-    echo "  - 停止服务: systemctl stop system-monitor"
-    echo "  - 启动服务: systemctl start system-monitor"
-    echo "  - 重启服务: systemctl restart system-monitor"
-    echo "  - 查看日志: journalctl -u system-monitor -f"
-    echo "  - 卸载服务: systemctl stop system-monitor && systemctl disable system-monitor && rm -rf $INSTALL_DIR && rm $SERVICE_FILE && systemctl daemon-reload"
+    echo "查看状态: systemctl status system-monitor"
+    echo "查看日志: journalctl -u system-monitor -f"
     echo ""
 else
     echo ""
     echo "=========================================="
-    echo "  ✗ 服务启动失败"
+    echo "  ✗ 安装失败"
     echo "=========================================="
     echo ""
-    echo "请查看日志: journalctl -u system-monitor -n 50"
+    echo "查看日志: cat $LOG_FILE"
     exit 1
 fi
