@@ -25,17 +25,18 @@ echo "1. 检查依赖..."
 # 检查并安装必要的工具
 if ! command -v lsof &> /dev/null; then
     echo "   安装 lsof..."
-    apt-get update -qq && apt-get install -y lsof > /dev/null 2>&1 || yum install -y lsof > /dev/null 2>&1
+    apt-get update -qq 2>&1 | grep -v "^$" || true
+    apt-get install -y lsof 2>&1 | grep -v "^$" || yum install -y lsof 2>&1 | grep -v "^$" || true
 fi
 
 if ! command -v nc &> /dev/null; then
     echo "   安装 netcat..."
-    apt-get install -y netcat > /dev/null 2>&1 || yum install -y nc > /dev/null 2>&1
+    apt-get install -y netcat 2>&1 | grep -v "^$" || yum install -y nc 2>&1 | grep -v "^$" || true
 fi
 
 if ! command -v smartctl &> /dev/null; then
     echo "   安装 smartmontools..."
-    apt-get install -y smartmontools > /dev/null 2>&1 || yum install -y smartmontools > /dev/null 2>&1
+    apt-get install -y smartmontools 2>&1 | grep -v "^$" || yum install -y smartmontools 2>&1 | grep -v "^$" || true
 fi
 
 echo "   ✓ 依赖检查完成"
