@@ -34,21 +34,42 @@ echo ""
 # 1. 检查依赖 (20%)
 show_progress 1 5 "检查系统依赖..."
 {
+    # 安装lsof
     if ! command -v lsof &> /dev/null; then
         apt-get update -qq >> "$LOG_FILE" 2>&1 || true
         apt-get install -y lsof >> "$LOG_FILE" 2>&1 || yum install -y lsof >> "$LOG_FILE" 2>&1 || true
     fi
     
+    # 安装netcat
     if ! command -v nc &> /dev/null; then
         apt-get install -y netcat >> "$LOG_FILE" 2>&1 || yum install -y nc >> "$LOG_FILE" 2>&1 || true
     fi
     
+    # 安装smartmontools（带重试机制）
     if ! command -v smartctl &> /dev/null; then
-        apt-get install -y smartmontools >> "$LOG_FILE" 2>&1 || yum install -y smartmontools >> "$LOG_FILE" 2>&1 || true
+        for i in 1 2 3; do
+            if command -v apt-get &> /dev/null; then
+                apt-get install -y smartmontools >> "$LOG_FILE" 2>&1 && break
+            elif command -v yum &> /dev/null; then
+                yum install -y smartmontools >> "$LOG_FILE" 2>&1 && break
+            elif command -v dnf &> /dev/null; then
+                dnf install -y smartmontools >> "$LOG_FILE" 2>&1 && break
+            fi
+            sleep 2
+        done
     fi
 } &
 wait $!
 echo ""
+
+# 限制日志文件大小
+if [ -f "$LOG_FILE" ]; then
+    LOG_SIZE=$(stat -f%z "$LOG_FILE" 2>/dev/null || stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)
+    if [ "$LOG_SIZE" -gt 10485760 ]; then  # 10MB
+        tail -n 1000 "$LOG_FILE" > "${LOG_FILE}.tmp"
+        mv "${LOG_FILE}.tmp" "$LOG_FILE"
+    fi
+fi
 
 # 2. 停止旧服务 (40%)
 show_progress 2 5 "停止旧服务..."
