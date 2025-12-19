@@ -802,7 +802,56 @@ EOF
 }
 
 while true; do
+    # 使用命名管道处理请求
+    REQUEST=$(mktemp)
+    RESPONSE=$(mktemp)
+    
+    # 接收请求
+    nc -l -p $PORT > "$REQUEST" 2>/dev/null &
+    NC_PID=$!
+    sleep 0.3
+    
+    # 读取请求的第一行
+    REQUEST_LINE=$(head -1 "$REQUEST" 2>/dev/null)
+    
+    # 检查是否是POST请求
+    if echo "$REQUEST_LINE" | grep -q "POST /reboot"; then
+        # 重启命令
+        {
+            echo "HTTP/1.1 200 OK"
+            echo "Content-Type: text/plain"
+            echo "Connection: close"
+            echo ""
+            echo "Reboot command executed"
+        } > "$RESPONSE"
+        cat "$RESPONSE" | nc -l -p $PORT -w 1 > /dev/null 2>&1
+        rm -f "$REQUEST" "$RESPONSE"
+        # 延迟2秒后执行重启
+        (sleep 2 && reboot) &
+        continue
+    elif echo "$REQUEST_LINE" | grep -q "POST /shutdown"; then
+        # 关机命令
+        {
+            echo "HTTP/1.1 200 OK"
+            echo "Content-Type: text/plain"
+            echo "Connection: close"
+            echo ""
+            echo "Shutdown command executed"
+        } > "$RESPONSE"
+        cat "$RESPONSE" | nc -l -p $PORT -w 1 > /dev/null 2>&1
+        rm -f "$REQUEST" "$RESPONSE"
+        # 延迟2秒后执行关机
+        (sleep 2 && sudo poweroff) &
+        continue
+    fi
+    
+    # 正常的GET请求，返回监控页面
     generate_page | nc -l -p $PORT -w 3 > /dev/null 2>&1
+    
+    # 清理临时文件
+    rm -f "$REQUEST" "$RESPONSE"
+    kill $NC_PID 2>/dev/null
+    wait $NC_PID 2>/dev/null
 done
 MONITOR_SCRIPT_EOF
 
