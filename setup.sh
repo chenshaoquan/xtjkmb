@@ -1,52 +1,70 @@
 #!/bin/bash
 
-# System Monitor Web Dashboard - 一键安装脚本
-# 使用方法: curl -fsSL https://raw.githubusercontent.com/chenshaoquan/xtjkmb/main/setup.sh | sudo bash
+# 系统监控面板 - 单文件安装脚本
+# 功能：自动安装依赖、systemctl运行、日志管理、端口冲突处理
 
-# 检查是否为root用户
+set -e
+
+PORT=8888
+INSTALL_DIR="/opt/system-monitor"
+LOG_FILE="/var/log/system-monitor.log"
+MAX_LOG_SIZE=10485760  # 10MB
+
+# 检查root权限
 if [ "$EUID" -ne 0 ]; then 
-    echo "错误: 请使用root权限运行此脚本"
+    echo "请使用root权限运行此脚本"
     exit 1
 fi
 
-# 安装目录
-INSTALL_DIR="/opt/system-monitor"
-SERVICE_FILE="/etc/systemd/system/system-monitor.service"
-LOG_FILE="/tmp/system-monitor-install.log"
+echo "========================================="
+echo "  系统监控面板 - 自动安装"
+echo "========================================="
 
-# 清空日志
-> "$LOG_FILE"
-
-# 进度显示函数
-show_progress() {
-    local current=$1
-    local total=$2
-    local msg=$3
-    local percent=$((current * 100 / total))
-    printf "\r[%3d%%] %s" "$percent" "$msg"
+# 日志轮转函数 - 防止日志挤爆磁盘
+rotate_log() {
+    if [ -f "$LOG_FILE" ]; then
+        LOG_SIZE=$(stat -c%s "$LOG_FILE" 2>/dev/null || stat -f%z "$LOG_FILE" 2>/dev/null || echo 0)
+        if [ "$LOG_SIZE" -gt "$MAX_LOG_SIZE" ]; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - 日志文件过大，执行轮转..." >> "$LOG_FILE"
+            tail -n 500 "$LOG_FILE" > "${LOG_FILE}.tmp"
+            mv "${LOG_FILE}.tmp" "$LOG_FILE"
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - 日志轮转完成" >> "$LOG_FILE"
+        fi
+    fi
 }
 
-echo "=========================================="
-echo "  System Monitor 安装中..."
-echo "=========================================="
-echo ""
+# 清理8888端口占用
+cleanup_port() {
+    echo "检查端口 $PORT 占用情况..."
+    PID=$(lsof -ti:$PORT 2>/dev/null || true)
+    if [ ! -z "$PID" ]; then
+        echo "端口 $PORT 被进程 $PID 占用，强制清除..."
+        kill -9 $PID 2>/dev/null || true
+        sleep 1
+    fi
+}
 
-# 1. 检查依赖 (20%)
-show_progress 1 5 "检查系统依赖..."
-{
+# 安装依赖函数
+install_dependencies() {
+    echo "检查并安装依赖..."
+    rotate_log
+    
     # 安装lsof
     if ! command -v lsof &> /dev/null; then
+        echo "安装 lsof..."
         apt-get update -qq >> "$LOG_FILE" 2>&1 || true
         apt-get install -y lsof >> "$LOG_FILE" 2>&1 || yum install -y lsof >> "$LOG_FILE" 2>&1 || true
     fi
     
     # 安装netcat
     if ! command -v nc &> /dev/null; then
+        echo "安装 netcat..."
         apt-get install -y netcat >> "$LOG_FILE" 2>&1 || yum install -y nc >> "$LOG_FILE" 2>&1 || true
     fi
     
-    # 安装smartmontools（带重试机制）
+    # 安装smartmontools
     if ! command -v smartctl &> /dev/null; then
+        echo "安装 smartmontools..."
         for i in 1 2 3; do
             if command -v apt-get &> /dev/null; then
                 apt-get install -y smartmontools >> "$LOG_FILE" 2>&1 && break
@@ -58,871 +76,429 @@ show_progress 1 5 "检查系统依赖..."
             sleep 2
         done
     fi
-} &
-wait $!
-echo ""
+    
+    echo "依赖检查完成"
+}
 
-# 限制日志文件大小
-if [ -f "$LOG_FILE" ]; then
-    LOG_SIZE=$(stat -f%z "$LOG_FILE" 2>/dev/null || stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)
-    if [ "$LOG_SIZE" -gt 10485760 ]; then  # 10MB
-        tail -n 1000 "$LOG_FILE" > "${LOG_FILE}.tmp"
-        mv "${LOG_FILE}.tmp" "$LOG_FILE"
-    fi
-fi
-
-# 2. 停止旧服务 (40%)
-show_progress 2 5 "停止旧服务..."
-systemctl is-active --quiet system-monitor && systemctl stop system-monitor >> "$LOG_FILE" 2>&1 || true
-echo ""
-
-# 3. 创建安装目录 (60%)
-show_progress 3 5 "创建安装目录..."
-mkdir -p "$INSTALL_DIR" >> "$LOG_FILE" 2>&1
-echo ""
-
-# 4. 创建监控脚本 (80%)
-show_progress 4 5 "创建监控脚本..."
-cat > "$INSTALL_DIR/monitor.sh" << 'MONITOR_SCRIPT_EOF'
-#!/bin/sh
+# 创建监控脚本
+create_monitor_script() {
+    echo "创建监控脚本..."
+    mkdir -p "$INSTALL_DIR"
+    
+    cat > "$INSTALL_DIR/monitor.sh" << 'MONITOR_EOF'
+#!/bin/bash
 
 PORT=8888
 LOG_FILE="/var/log/system-monitor.log"
-SMARTCTL_CHECK_FILE="/var/run/system-monitor-smartctl-check"
-SMARTCTL_INSTALL_LOCK="/var/run/system-monitor-smartctl-install.lock"
+MAX_LOG_SIZE=10485760
 
-# 日志轮转函数
+# 日志轮转
 rotate_log() {
     if [ -f "$LOG_FILE" ]; then
         LOG_SIZE=$(stat -c%s "$LOG_FILE" 2>/dev/null || stat -f%z "$LOG_FILE" 2>/dev/null || echo 0)
-        if [ "$LOG_SIZE" -gt 10485760 ]; then  # 10MB
-            tail -n 1000 "$LOG_FILE" > "${LOG_FILE}.tmp"
+        if [ "$LOG_SIZE" -gt "$MAX_LOG_SIZE" ]; then
+            tail -n 500 "$LOG_FILE" > "${LOG_FILE}.tmp"
             mv "${LOG_FILE}.tmp" "$LOG_FILE"
         fi
     fi
 }
 
-# 安装 smartmontools 函数
-install_smartmontools() {
-    # 检查是否有其他进程正在安装
-    if [ -f "$SMARTCTL_INSTALL_LOCK" ]; then
-        LOCK_AGE=$(($(date +%s) - $(stat -c%Y "$SMARTCTL_INSTALL_LOCK" 2>/dev/null || echo 0)))
-        if [ $LOCK_AGE -lt 300 ]; then  # 5分钟内的锁有效
-            echo "Another installation process is running, skipping..." | tee -a "$LOG_FILE"
-            return 1
-        else
-            # 锁文件过期，删除
-            rm -f "$SMARTCTL_INSTALL_LOCK"
-        fi
+# 每30分钟检查并安装依赖
+check_dependencies() {
+    if ! command -v smartctl &> /dev/null; then
+        for i in 1 2 3; do
+            if command -v apt-get &> /dev/null; then
+                apt-get install -y smartmontools >> "$LOG_FILE" 2>&1 && break
+            elif command -v yum &> /dev/null; then
+                yum install -y smartmontools >> "$LOG_FILE" 2>&1 && break
+            fi
+            sleep 2
+        done
     fi
-    
-    # 创建锁文件
-    touch "$SMARTCTL_INSTALL_LOCK"
-    
-    echo "smartmontools not found, installing..." | tee -a "$LOG_FILE"
-    
-    # 尝试5次安装
-    for attempt in 1 2 3 4 5; do
-        echo "Installation attempt $attempt/5..." | tee -a "$LOG_FILE"
-        
-        if command -v apt-get >/dev/null 2>&1; then
-            apt-get update -qq >> "$LOG_FILE" 2>&1
-            if apt-get install -y smartmontools >> "$LOG_FILE" 2>&1; then
-                break
-            fi
-        elif command -v yum >/dev/null 2>&1; then
-            if yum install -y smartmontools >> "$LOG_FILE" 2>&1; then
-                break
-            fi
-        elif command -v dnf >/dev/null 2>&1; then
-            if dnf install -y smartmontools >> "$LOG_FILE" 2>&1; then
-                break
-            fi
-        elif command -v pacman >/dev/null 2>&1; then
-            if pacman -S --noconfirm smartmontools >> "$LOG_FILE" 2>&1; then
-                break
-            fi
-        fi
-        
-        if [ $attempt -lt 5 ]; then
-            echo "Installation attempt $attempt failed, retrying in 3 seconds..." | tee -a "$LOG_FILE"
-            sleep 3
-        fi
+}
+
+# 后台定时检查依赖
+(
+    while true; do
+        sleep 1800  # 30分钟
+        check_dependencies
+        rotate_log
     done
-    
-    # 删除锁文件
-    rm -f "$SMARTCTL_INSTALL_LOCK"
-    
-    # 验证安装
-    if command -v smartctl >/dev/null 2>&1; then
-        echo "smartmontools installed successfully." | tee -a "$LOG_FILE"
-        touch "$SMARTCTL_CHECK_FILE"
-        return 0
-    else
-        echo "Warning: Failed to install smartmontools after 5 attempts." | tee -a "$LOG_FILE"
-        return 1
-    fi
-}
+) &
 
-# 定时检测 smartmontools 函数
-check_smartmontools() {
-    # 如果已安装，更新检查时间戳
+get_json_data() {
+    # CPU
+    CPU_MODEL=$(grep 'model name' /proc/cpuinfo | head -1 | cut -d':' -f2 | xargs)
+    CPU_CORES=$(nproc)
+    CPU_USAGE=$(top -bn1 | grep "Cpu(s)" | awk '{print $2}' | cut -d'%' -f1)
+    
+    # 内存
+    MEM_TOTAL=$(free -h | awk '/^Mem:/ {print $2}')
+    MEM_USED=$(free -h | awk '/^Mem:/ {print $3}')
+    MEM_FREE=$(free -h | awk '/^Mem:/ {print $4}')
+    MEM_PERCENT=$(free | awk '/^Mem:/ {printf "%.0f", $3/$2*100}')
+    
+    # 磁盘分区信息
+    PARTITIONS_DATA=""
+    while read -r line; do
+        DEV=$(echo "$line" | awk '{print $1}')
+        SIZE=$(echo "$line" | awk '{print $2}')
+        USED=$(echo "$line" | awk '{print $3}')
+        AVAIL=$(echo "$line" | awk '{print $4}')
+        PCT=$(echo "$line" | awk '{print $5}' | tr -d '%')
+        MOUNT=$(echo "$line" | awk '{print $6}')
+        [ ! -z "$PARTITIONS_DATA" ] && PARTITIONS_DATA="$PARTITIONS_DATA,"
+        PARTITIONS_DATA="${PARTITIONS_DATA}{\"dev\":\"$DEV\",\"size\":\"$SIZE\",\"used\":\"$USED\",\"avail\":\"$AVAIL\",\"pct\":\"$PCT\",\"mount\":\"$MOUNT\"}"
+    done < <(df -h | grep -E "^/dev/" | grep -v "/boot")
+    
+    # 物理磁盘健康状态
+    DISKS_HEALTH=""
     if command -v smartctl >/dev/null 2>&1; then
-        touch "$SMARTCTL_CHECK_FILE"
-        return 0
+        for disk in $(lsblk -d -n -o NAME,TYPE | awk '$2=="disk" {print $1}'); do
+            HEALTH=$(smartctl -H /dev/$disk 2>/dev/null | grep -i "SMART overall-health" | awk -F': ' '{print $2}' || echo "N/A")
+            [ -z "$HEALTH" ] && HEALTH="N/A"
+            MODEL=$(smartctl -i /dev/$disk 2>/dev/null | grep -E "Device Model|Model Number" | awk -F': ' '{print $2}' | xargs || echo "Unknown")
+            HOURS=$(smartctl -a /dev/$disk 2>/dev/null | grep "Power On Hours:" | awk '{print $4}' | tr -d ',' | head -1)
+            if [ -z "$HOURS" ]; then
+                HOURS=$(smartctl -A /dev/$disk 2>/dev/null | awk '/Power_On_Hours/ {print $10}' | head -1)
+            fi
+            [ -z "$HOURS" ] && HOURS="0"
+            TEMP=$(smartctl -A /dev/$disk 2>/dev/null | awk '/Temperature_Celsius/ {print $10}' | head -1)
+            if [ -z "$TEMP" ]; then
+                TEMP=$(smartctl -a /dev/$disk 2>/dev/null | grep "Temperature:" | head -1 | awk '{print $2}')
+            fi
+            [ -z "$TEMP" ] && TEMP="N/A"
+            HEALTH_PCT=$(smartctl -a /dev/$disk 2>/dev/null | grep "Available Spare:" | awk '{print $3}' | tr -d '%' | head -1)
+            if [ -z "$HEALTH_PCT" ]; then
+                HEALTH_PCT=$(smartctl -A /dev/$disk 2>/dev/null | awk '/Wear_Leveling_Count|Media_Wearout_Indicator/ {print $4}' | head -1)
+            fi
+            if [ -z "$HEALTH_PCT" ]; then
+                USED_PCT=$(smartctl -a /dev/$disk 2>/dev/null | grep "Percentage Used:" | awk '{print $3}' | tr -d '%' | head -1)
+                if [ ! -z "$USED_PCT" ]; then
+                    HEALTH_PCT=$((100 - USED_PCT))
+                fi
+            fi
+            [ -z "$HEALTH_PCT" ] && HEALTH_PCT="100"
+            [ ! -z "$DISKS_HEALTH" ] && DISKS_HEALTH="$DISKS_HEALTH,"
+            DISKS_HEALTH="${DISKS_HEALTH}{\"disk\":\"$disk\",\"model\":\"$MODEL\",\"health\":\"$HEALTH\",\"healthPct\":\"$HEALTH_PCT\",\"hours\":\"$HOURS\",\"temp\":\"$TEMP\"}"
+        done
     fi
     
-    # 检查上次检测时间
-    if [ -f "$SMARTCTL_CHECK_FILE" ]; then
-        LAST_CHECK=$(stat -c%Y "$SMARTCTL_CHECK_FILE" 2>/dev/null || echo 0)
-        CURRENT_TIME=$(date +%s)
-        TIME_DIFF=$((CURRENT_TIME - LAST_CHECK))
+    # 系统
+    OS_NAME=$(cat /etc/os-release 2>/dev/null | grep "^PRETTY_NAME" | cut -d'"' -f2 || uname -s)
+    KERNEL=$(uname -r)
+    UPTIME=$(uptime -p 2>/dev/null || uptime | awk -F'up ' '{print $2}' | awk -F',' '{print $1}')
+    CURRENT_TIME=$(date '+%Y-%m-%d %H:%M:%S')
+    
+    # GPU
+    GPU_DATA=""
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        declare -A PCIE_INFO
+        while IFS=',' read -r IDX BUS GEN_CUR GEN_MAX WIDTH_CUR WIDTH_MAX; do
+            IDX=$(echo "$IDX" | xargs)
+            BUS=$(echo "$BUS" | xargs)
+            GEN_CUR=$(echo "$GEN_CUR" | xargs)
+            GEN_MAX=$(echo "$GEN_MAX" | xargs)
+            WIDTH_CUR=$(echo "$WIDTH_CUR" | xargs)
+            WIDTH_MAX=$(echo "$WIDTH_MAX" | xargs)
+            PCIE_INFO[$IDX]="$BUS|$GEN_CUR|$GEN_MAX|$WIDTH_CUR|$WIDTH_MAX"
+        done < <(nvidia-smi --query-gpu=index,pci.bus_id,pcie.link.gen.current,pcie.link.gen.max,pcie.link.width.current,pcie.link.width.max --format=csv,noheader 2>/dev/null)
         
-        # 每30分钟检测一次
-        if [ $TIME_DIFF -lt 1800 ]; then
-            return 1
-        fi
+        while IFS=',' read -r IDX NAME DRIVER TEMP UTIL MEM_USED_G MEM_TOTAL_G POWER; do
+            [ -z "$IDX" ] && continue
+            IDX=$(echo "$IDX" | xargs)
+            NAME=$(echo "$NAME" | xargs)
+            DRIVER=$(echo "$DRIVER" | xargs)
+            TEMP=$(echo "$TEMP" | xargs)
+            UTIL=$(echo "$UTIL" | xargs)
+            MEM_USED_G=$(echo "$MEM_USED_G" | xargs)
+            MEM_TOTAL_G=$(echo "$MEM_TOTAL_G" | xargs)
+            POWER=$(echo "$POWER" | xargs)
+            MEM_PCT=$(awk "BEGIN {printf \"%.0f\", ($MEM_USED_G/$MEM_TOTAL_G)*100}" 2>/dev/null || echo "0")
+            PCIE="${PCIE_INFO[$IDX]}"
+            if [ ! -z "$PCIE" ]; then
+                IFS='|' read -r BUS GEN_CUR GEN_MAX WIDTH_CUR WIDTH_MAX <<< "$PCIE"
+            else
+                BUS="N/A"; GEN_CUR="0"; GEN_MAX="0"; WIDTH_CUR="0"; WIDTH_MAX="0"
+            fi
+            [ ! -z "$GPU_DATA" ] && GPU_DATA="$GPU_DATA,"
+            GPU_DATA="${GPU_DATA}{\"idx\":$IDX,\"name\":\"$NAME\",\"driver\":\"$DRIVER\",\"temp\":$TEMP,\"util\":$UTIL,\"memUsed\":$MEM_USED_G,\"memTotal\":$MEM_TOTAL_G,\"memPct\":$MEM_PCT,\"power\":\"$POWER\",\"pciBus\":\"$BUS\",\"pciGenCur\":\"$GEN_CUR\",\"pciGenMax\":\"$GEN_MAX\",\"pciWidthCur\":\"$WIDTH_CUR\",\"pciWidthMax\":\"$WIDTH_MAX\"}"
+        done < <(nvidia-smi --query-gpu=index,name,driver_version,temperature.gpu,utilization.gpu,memory.used,memory.total,power.draw --format=csv,noheader,nounits 2>/dev/null)
     fi
     
-    # 尝试安装
-    install_smartmontools
+    echo "{\"cpu\":{\"model\":\"$CPU_MODEL\",\"cores\":\"$CPU_CORES\",\"usage\":\"$CPU_USAGE\"},\"mem\":{\"total\":\"$MEM_TOTAL\",\"used\":\"$MEM_USED\",\"free\":\"$MEM_FREE\",\"pct\":\"$MEM_PERCENT\"},\"sys\":{\"os\":\"$OS_NAME\",\"kernel\":\"$KERNEL\",\"uptime\":\"$UPTIME\",\"time\":\"$CURRENT_TIME\"},\"disks\":[${DISKS_HEALTH}],\"partitions\":[${PARTITIONS_DATA}],\"gpus\":[$GPU_DATA]}"
 }
-
-# 首次运行时检查并安装 smartmontools
-if ! command -v smartctl >/dev/null 2>&1; then
-    install_smartmontools
-fi
-
-# 执行日志轮转
-rotate_log
-
-echo "Checking if port $PORT is in use..."
-PID=$(lsof -ti:$PORT)
-
-if [ ! -z "$PID" ]; then
-    echo "Port $PORT is occupied by process $PID, killing it..."
-    kill -9 $PID
-    sleep 1
-fi
-
-echo "Starting web monitoring server on port $PORT..."
 
 generate_page() {
-    # 定时检测smartmontools（每30分钟）
-    check_smartmontools &
+    DATA=$(get_json_data)
     
     echo "HTTP/1.1 200 OK"
     echo "Content-Type: text/html; charset=UTF-8"
     echo "Cache-Control: no-cache"
     echo "Connection: close"
     echo ""
-        cat << 'EOF'
+    
+    cat << 'HTMLSTART'
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>系统监控面板</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1.0">
+    <title>系统监控中心</title>
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
-            padding: 20px;
-            min-height: 100vh;
-        }
-        .container {
-            max-width: 1400px;
-            margin: 0 auto;
-        }
-        h1 {
-            text-align: center;
-            color: #2c3e50;
-            margin-bottom: 30px;
-            font-size: 2.5em;
-            text-shadow: 2px 2px 4px rgba(0,0,0,0.1);
-        }
-        .grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
-            gap: 15px;
-            margin-bottom: 15px;
-        }
-        .card {
-            background: white;
-            border-radius: 8px;
-            padding: 15px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-            transition: transform 0.3s ease, box-shadow 0.3s ease;
-            height: 320px;
-            display: flex;
-            flex-direction: column;
-        }
-        .card-content {
-            flex: 1;
-            overflow-y: auto;
-            overflow-x: hidden;
-        }
-        .card-content::-webkit-scrollbar {
-            width: 6px;
-        }
-        .card-content::-webkit-scrollbar-track {
-            background: #f1f1f1;
-            border-radius: 3px;
-        }
-        .card-content::-webkit-scrollbar-thumb {
-            background: #888;
-            border-radius: 3px;
-        }
-        .card-content::-webkit-scrollbar-thumb:hover {
-            background: #555;
-        }
-        .card:hover {
-            transform: translateY(-5px);
-            box-shadow: 0 8px 12px rgba(0,0,0,0.15);
-        }
-        .card-title {
-            font-size: 1.5em;
-            color: #34495e;
-            margin-bottom: 15px;
-            border-bottom: 3px solid #3498db;
-            padding-bottom: 10px;
-        }
-        .info-row {
-            display: flex;
-            justify-content: space-between;
-            padding: 10px 0;
-            border-bottom: 1px solid #ecf0f1;
-        }
-        .info-row:last-child {
-            border-bottom: none;
-        }
-        .label {
-            font-weight: 600;
-            color: #555;
-        }
-        .value {
-            color: #2c3e50;
-            font-family: 'Courier New', monospace;
-        }
-        .progress-bar {
-            width: 100%;
-            height: 25px;
-            background: #ecf0f1;
-            border-radius: 12px;
-            overflow: hidden;
-            margin-top: 8px;
-            position: relative;
-        }
-        .progress-fill {
-            height: 100%;
-            background: linear-gradient(90deg, #3498db, #2ecc71);
-            transition: width 0.5s ease;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            color: white;
-            font-weight: bold;
-            font-size: 0.9em;
-        }
-        .progress-fill.warning {
-            background: linear-gradient(90deg, #f39c12, #e67e22);
-        }
-        .progress-fill.danger {
-            background: linear-gradient(90deg, #e74c3c, #c0392b);
-        }
-        .refresh-info {
-            text-align: center;
-            color: #7f8c8d;
-            margin-top: 20px;
-            font-size: 0.9em;
-        }
-        pre {
-            background: #2c3e50;
-            color: #ecf0f1;
-            padding: 15px;
-            border-radius: 8px;
-            overflow-x: auto;
-            font-size: 0.85em;
-            line-height: 1.4;
-        }
-        .gpu-section {
-            grid-column: 1 / -1;
-        }
-        .gpu-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-            gap: 10px;
-            margin-bottom: 10px;
-        }
-        .gpu-card {
-            background: white;
-            border-radius: 6px;
-            padding: 12px;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-            transition: transform 0.2s ease, box-shadow 0.2s ease;
-        }
-        .gpu-card:hover {
-            transform: translateY(-3px);
-            box-shadow: 0 4px 8px rgba(0,0,0,0.15);
-        }
-        .gpu-card .card-title {
-            font-size: 1em;
-            margin-bottom: 8px;
-            padding-bottom: 5px;
-            font-weight: 600;
-        }
-        .gpu-card .info-row {
-            padding: 4px 0;
-            font-size: 0.85em;
-        }
-        .gpu-card .progress-bar {
-            height: 14px;
-            margin-top: 3px;
-        }
-        .gpu-card .progress-fill {
-            font-size: 0.7em;
-        }
+        *{margin:0;padding:0;box-sizing:border-box}
+        body{font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;background:#0a0a0f;color:#e2e8f0;min-height:100vh;position:relative}
+        .bg{position:fixed;top:0;left:0;width:100%;height:100%;background:radial-gradient(ellipse at 20% 50%,rgba(59,130,246,.15) 0%,transparent 50%),radial-gradient(ellipse at 80% 20%,rgba(147,51,234,.15) 0%,transparent 50%),radial-gradient(ellipse at 40% 80%,rgba(6,182,212,.1) 0%,transparent 50%);z-index:-1}
+        .grid-bg{position:fixed;top:0;left:0;width:100%;height:100%;background-image:linear-gradient(rgba(59,130,246,.03) 1px,transparent 1px),linear-gradient(90deg,rgba(59,130,246,.03) 1px,transparent 1px);background-size:50px 50px;z-index:-1}
+        .container{max-width:1400px;margin:0 auto;padding:20px}
+        header{text-align:center;padding:30px 0;margin-bottom:30px}
+        h1{font-size:2.5em;font-weight:700;background:linear-gradient(135deg,#3b82f6,#8b5cf6,#06b6d4);-webkit-background-clip:text;-webkit-text-fill-color:transparent;animation:glow 3s ease-in-out infinite}
+        @keyframes glow{0%,100%{filter:drop-shadow(0 0 20px rgba(59,130,246,.5))}50%{filter:drop-shadow(0 0 30px rgba(139,92,246,.7))}}
+        .subtitle{color:#64748b;font-size:.9em;letter-spacing:3px;text-transform:uppercase}
+        .system-overview{margin-bottom:25px}
+        .disk-overview{margin-bottom:25px;max-height:400px}
+        .disk-overview .overview-grid{max-height:320px;overflow-y:auto}
+        .disk-overview .overview-grid::-webkit-scrollbar{width:8px}
+        .disk-overview .overview-grid::-webkit-scrollbar-track{background:rgba(255,255,255,.05);border-radius:4px}
+        .disk-overview .overview-grid::-webkit-scrollbar-thumb{background:rgba(59,130,246,.3);border-radius:4px}
+        .disk-overview .overview-grid::-webkit-scrollbar-thumb:hover{background:rgba(59,130,246,.5)}
+        .overview-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:25px}
+        .overview-section{background:rgba(255,255,255,.02);border-radius:12px;padding:18px}
+        .section-header{display:flex;align-items:center;gap:10px;font-size:1em;font-weight:600;color:#4fd1c5;margin-bottom:15px}
+        .section-header .card-icon{margin-bottom:0;width:32px;height:32px;font-size:1em}
+        .gpu-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(350px,1fr));gap:20px}
+        .card{background:rgba(15,23,42,.8);border:1px solid rgba(59,130,246,.2);border-radius:16px;padding:24px;backdrop-filter:blur(10px);position:relative;overflow:hidden;transition:all .3s ease}
+        .card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,#3b82f6,#8b5cf6,#06b6d4)}
+        .card:hover{transform:translateY(-4px);border-color:rgba(59,130,246,.4);box-shadow:0 20px 40px rgba(59,130,246,.15)}
+        .card-icon{width:40px;height:40px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:1.2em;margin-bottom:15px}
+        .card-icon.cpu{background:linear-gradient(135deg,#3b82f6,#1d4ed8)}
+        .card-icon.mem{background:linear-gradient(135deg,#8b5cf6,#6d28d9)}
+        .card-icon.disk{background:linear-gradient(135deg,#06b6d4,#0891b2)}
+        .card-icon.sys{background:linear-gradient(135deg,#10b981,#059669)}
+        .card-icon.gpu{background:linear-gradient(135deg,#f59e0b,#d97706)}
+        .card-title{font-size:1.1em;font-weight:600;color:#f1f5f9;margin-bottom:20px;display:flex;align-items:center;gap:12px}
+        .row{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.05)}
+        .row:last-of-type{border-bottom:none}
+        .label{color:#94a3b8;font-size:.9em}
+        .value{color:#f1f5f9;font-weight:500}
+        .prog-section{margin-top:15px}
+        .prog-header{display:flex;justify-content:space-between;margin-bottom:8px;font-size:.85em}
+        .prog-bar{width:100%;height:6px;background:rgba(255,255,255,.1);border-radius:3px;overflow:hidden}
+        .prog-fill{height:100%;border-radius:3px;background:linear-gradient(90deg,#3b82f6,#8b5cf6);transition:width .5s ease}
+        .prog-fill.warn{background:linear-gradient(90deg,#f59e0b,#d97706)}
+        .prog-fill.danger{background:linear-gradient(90deg,#ef4444,#dc2626)}
+        @media(max-width:768px){.container{padding:15px}h1{font-size:1.8em}.overview-grid,.gpu-grid{grid-template-columns:1fr;gap:15px}.card{padding:20px}}
+        @media(max-width:480px){h1{font-size:1.5em}.subtitle{font-size:.8em}.card{padding:16px}}
     </style>
 </head>
 <body>
-    <div class="container">
-        <h1>系统监控面板</h1>
-        
-        <div class="grid">
-            <!-- CPU 信息 -->
-            <div class="card">
-                <div class="card-title">CPU 信息</div>
-                <div class="card-content">
-EOF
-
-# CPU 信息
-echo "                    <div class=\"info-row\">"
-echo "                    <span class=\"label\">CPU 型号:</span>"
-echo "                    <span class=\"value\">$(grep 'model name' /proc/cpuinfo | head -1 | cut -d':' -f2 | xargs)</span>"
-echo "                </div>"
-
-echo "                <div class=\"info-row\">"
-echo "                    <span class=\"label\">核心数:</span>"
-echo "                    <span class=\"value\">$(nproc) 核</span>"
-echo "                </div>"
-
-# CPU 使用率 - 随机生成 10%-28% 之间的值
-RANDOM_NUM=$(awk -v min=10 -v max=28 'BEGIN{srand(); print int(min+rand()*(max-min+1))}')
-CPU_USAGE="${RANDOM_NUM}.$(awk 'BEGIN{srand(); print int(rand()*10)}')"
-CPU_USAGE_INT=$RANDOM_NUM
-CPU_CLASS=""
-if [ $CPU_USAGE_INT -gt 80 ]; then
-    CPU_CLASS="danger"
-elif [ $CPU_USAGE_INT -gt 60 ]; then
-    CPU_CLASS="warning"
-fi
-
-echo "                    <div class=\"info-row\">"
-echo "                        <span class=\"label\">CPU 使用率:</span>"
-echo "                    </div>"
-echo "                    <div class=\"progress-bar\">"
-echo "                        <div class=\"progress-fill $CPU_CLASS\" style=\"width: ${CPU_USAGE_INT}%\">${CPU_USAGE}%</div>"
-echo "                    </div>"
-
-# 平均负载
-LOAD_AVG=$(uptime | awk -F'load average:' '{print $2}')
-echo "                    <div class=\"info-row\">"
-echo "                        <span class=\"label\">平均负载:</span>"
-echo "                        <span class=\"value\">$LOAD_AVG</span>"
-echo "                    </div>"
-echo "                </div>"
-
-cat << 'EOF'
+<div class="bg"></div>
+<div class="grid-bg"></div>
+<div class="container">
+    <header>
+        <h1>⚡ 系统监控中心</h1>
+        <div class="subtitle">System Monitor Dashboard</div>
+    </header>
+    <div class="system-overview card">
+        <div class="card-title" style="margin-bottom:25px">📊 系统概览</div>
+        <div class="overview-grid">
+            <div class="overview-section">
+                <div class="section-header"><div class="card-icon cpu">💻</div>CPU 信息</div>
+                <div id="cpu"></div>
             </div>
-
-            <!-- 内存信息 -->
-            <div class="card">
-                <div class="card-title">内存信息</div>
-                <div class="card-content">
-EOF
-
-# 内存信息
-MEM_TOTAL=$(free -h | awk '/^Mem:/ {print $2}')
-MEM_USED=$(free -h | awk '/^Mem:/ {print $3}')
-MEM_FREE=$(free -h | awk '/^Mem:/ {print $4}')
-MEM_PERCENT=$(free | awk '/^Mem:/ {printf "%.1f", $3/$2 * 100}')
-MEM_PERCENT_INT=$(printf "%.0f" $MEM_PERCENT)
-MEM_CLASS=""
-if [ $MEM_PERCENT_INT -gt 80 ]; then
-    MEM_CLASS="danger"
-elif [ $MEM_PERCENT_INT -gt 60 ]; then
-    MEM_CLASS="warning"
-fi
-
-echo "                    <div class=\"info-row\">"
-echo "                        <span class=\"label\">总内存:</span>"
-echo "                        <span class=\"value\">$MEM_TOTAL</span>"
-echo "                    </div>"
-
-echo "                    <div class=\"info-row\">"
-echo "                        <span class=\"label\">已使用:</span>"
-echo "                        <span class=\"value\">$MEM_USED</span>"
-echo "                    </div>"
-
-echo "                    <div class=\"info-row\">"
-echo "                        <span class=\"label\">可用:</span>"
-echo "                        <span class=\"value\">$MEM_FREE</span>"
-echo "                    </div>"
-
-echo "                    <div class=\"info-row\">"
-echo "                        <span class=\"label\">使用率:</span>"
-echo "                    </div>"
-echo "                    <div class=\"progress-bar\">"
-echo "                        <div class=\"progress-fill $MEM_CLASS\" style=\"width: ${MEM_PERCENT_INT}%\">${MEM_PERCENT}%</div>"
-echo "                    </div>"
-
-# Swap 信息
-SWAP_TOTAL=$(free -h | awk '/^Swap:/ {print $2}')
-SWAP_USED=$(free -h | awk '/^Swap:/ {print $3}')
-if [ "$SWAP_TOTAL" != "0B" ]; then
-    SWAP_PERCENT=$(free | awk '/^Swap:/ {if($2>0) printf "%.1f", $3/$2 * 100; else print "0"}')
-    echo "                    <div class=\"info-row\">"
-    echo "                        <span class=\"label\">Swap:</span>"
-    echo "                        <span class=\"value\">$SWAP_USED / $SWAP_TOTAL (${SWAP_PERCENT}%)</span>"
-    echo "                    </div>"
-fi
-
-echo "                </div>"
-
-cat << 'EOF'
+            <div class="overview-section">
+                <div class="section-header"><div class="card-icon mem">🧠</div>内存信息</div>
+                <div id="mem"></div>
             </div>
-
-            <!-- 磁盘分区信息 -->
-            <div class="card">
-                <div class="card-title">磁盘分区</div>
-                <div class="card-content">
-EOF
-
-# 磁盘分区信息
-df -h | grep '^/dev/' | while read line; do
-    DISK=$(echo $line | awk '{print $1}')
-    SIZE=$(echo $line | awk '{print $2}')
-    USED=$(echo $line | awk '{print $3}')
-    AVAIL=$(echo $line | awk '{print $4}')
-    USE_PERCENT=$(echo $line | awk '{print $5}' | sed 's/%//')
-    MOUNT=$(echo $line | awk '{print $6}')
-    
-    DISK_CLASS=""
-    if [ $USE_PERCENT -gt 80 ]; then
-        DISK_CLASS="danger"
-    elif [ $USE_PERCENT -gt 60 ]; then
-        DISK_CLASS="warning"
-    fi
-    
-    echo "                    <div class=\"info-row\">"
-    echo "                        <span class=\"label\">$MOUNT ($DISK):</span>"
-    echo "                        <span class=\"value\">$USED / $SIZE</span>"
-    echo "                    </div>"
-    echo "                    <div class=\"progress-bar\">"
-    echo "                        <div class=\"progress-fill $DISK_CLASS\" style=\"width: ${USE_PERCENT}%\">${USE_PERCENT}%</div>"
-    echo "                    </div>"
-done
-
-echo "                </div>"
-
-cat << 'EOF'
+            <div class="overview-section">
+                <div class="section-header"><div class="card-icon sys">🖥️</div>系统信息</div>
+                <div id="sys"></div>
             </div>
-
-            <!-- 磁盘健康度 -->
-            <div class="card">
-                <div class="card-title">磁盘健康度 (SMART)</div>
-                <div class="card-content">
-EOF
-
-# 获取所有物理磁盘设备
-PHYSICAL_DISKS=$(lsblk -d -n -o NAME,TYPE | grep 'disk' | awk '{print $1}')
-
-for DISK_NAME in $PHYSICAL_DISKS; do
-    DISK_DEV="/dev/$DISK_NAME"
-    HEALTH_STATUS="未知"
-    HEALTH_COLOR="#95a5a6"
-    DISK_MODEL="未知型号"
-    
-    # 尝试使用 smartctl 检查磁盘健康状态（带超时保护）
-    if command -v smartctl >/dev/null 2>&1; then
-        SMART_STATUS=$(timeout 2 smartctl -H $DISK_DEV 2>/dev/null | grep -i "SMART overall-health" | awk '{print $NF}')
-        DISK_MODEL=$(timeout 2 smartctl -i $DISK_DEV 2>/dev/null | grep "Device Model:" | cut -d':' -f2 | xargs)
-        if [ -z "$DISK_MODEL" ]; then
-            DISK_MODEL=$(timeout 2 smartctl -i $DISK_DEV 2>/dev/null | grep "Product:" | cut -d':' -f2 | xargs)
-        fi
-        if [ -z "$DISK_MODEL" ]; then
-            DISK_MODEL=$(lsblk -d -n -o MODEL /dev/$DISK_NAME 2>/dev/null | xargs)
-        fi
-        
-        # 获取健康百分比
-        HEALTH_PERCENT=""
-        if echo "$DISK_DEV" | grep -q "nvme"; then
-            # NVMe设备获取Percentage Used的反向值
-            PERCENT_USED=$(timeout 2 smartctl -A $DISK_DEV 2>/dev/null | grep "Percentage Used:" | awk '{print $3}' | sed 's/%//')
-            if [ ! -z "$PERCENT_USED" ]; then
-                HEALTH_PERCENT=$((100 - PERCENT_USED))
-            else
-                # 备选：使用Available Spare
-                HEALTH_PERCENT=$(timeout 2 smartctl -A $DISK_DEV 2>/dev/null | grep "Available Spare:" | awk '{print $3}' | sed 's/%//')
-            fi
-        else
-            # SATA设备：尝试获取Media_Wearout_Indicator或其他健康指标
-            # 优先查找SSD的磨损指标
-            HEALTH_PERCENT=$(timeout 2 smartctl -A $DISK_DEV 2>/dev/null | grep -i "Media_Wearout_Indicator\|Wear_Leveling_Count\|SSD_Life_Left" | head -1 | awk '{print $4}')
-            
-            # 如果没有找到，计算所有SMART属性的平均值
-            if [ -z "$HEALTH_PERCENT" ]; then
-                HEALTH_VALUES=$(timeout 2 smartctl -A $DISK_DEV 2>/dev/null | awk '/^[ ]*[0-9]/ && $4 ~ /^[0-9]+$/ {print $4}')
-                if [ ! -z "$HEALTH_VALUES" ]; then
-                    TOTAL=0
-                    COUNT=0
-                    for val in $HEALTH_VALUES; do
-                        if [ $val -le 100 ]; then
-                            TOTAL=$((TOTAL + val))
-                            COUNT=$((COUNT + 1))
-                        fi
-                    done
-                    if [ $COUNT -gt 0 ]; then
-                        HEALTH_PERCENT=$((TOTAL / COUNT))
-                    fi
-                fi
-            fi
-        fi
-        
-        if [ "$SMART_STATUS" = "PASSED" ]; then
-            HEALTH_STATUS="健康"
-            HEALTH_COLOR="#2ecc71"
-        elif [ "$SMART_STATUS" = "FAILED" ]; then
-            HEALTH_STATUS="故障"
-            HEALTH_COLOR="#e74c3c"
-        elif [ ! -z "$SMART_STATUS" ]; then
-            HEALTH_STATUS="警告"
-            HEALTH_COLOR="#f39c12"
-        else
-            HEALTH_STATUS="无法检测"
-            HEALTH_COLOR="#95a5a6"
-        fi
-    else
-        DISK_MODEL=$(lsblk -d -n -o MODEL /dev/$DISK_NAME 2>/dev/null | xargs)
-        HEALTH_STATUS="需安装 smartmontools"
-        HEALTH_COLOR="#95a5a6"
-    fi
-    
-    if [ -z "$DISK_MODEL" ] || [ "$DISK_MODEL" = "" ]; then
-        DISK_MODEL="未知型号"
-    fi
-    
-    echo "                    <div class=\"info-row\">"
-    echo "                        <span class=\"label\">$DISK_DEV:</span>"
-    echo "                        <span class=\"value\">$DISK_MODEL</span>"
-    echo "                    </div>"
-    echo "                    <div class=\"info-row\">"
-    echo "                        <span class=\"label\">健康状态:</span>"
-    if [ ! -z "$HEALTH_PERCENT" ]; then
-        echo "                        <span class=\"value\" style=\"color: $HEALTH_COLOR; font-weight: bold;\">$HEALTH_STATUS ($HEALTH_PERCENT%)</span>"
-    else
-        echo "                        <span class=\"value\" style=\"color: $HEALTH_COLOR; font-weight: bold;\">$HEALTH_STATUS</span>"
-    fi
-    echo "                    </div>"
-    
-    # 显示更多SMART信息（带超时保护）
-    if command -v smartctl >/dev/null 2>&1 && [ "$HEALTH_STATUS" != "需安装 smartmontools" ]; then
-        # 检测是否为NVMe设备
-        if echo "$DISK_DEV" | grep -q "nvme"; then
-            # NVMe设备使用不同的命令
-            TEMP=$(timeout 2 smartctl -A $DISK_DEV 2>/dev/null | grep -i "Temperature:" | head -1 | awk '{print $2}')
-            POWER_ON=$(timeout 2 smartctl -A $DISK_DEV 2>/dev/null | grep -i "Power On Hours:" | awk '{print $4}' | sed 's/,//g')
-        else
-            # SATA/SAS设备
-            TEMP=$(timeout 2 smartctl -A $DISK_DEV 2>/dev/null | grep -i "Temperature_Celsius" | awk '{print $10}')
-            POWER_ON=$(timeout 2 smartctl -A $DISK_DEV 2>/dev/null | grep -i "Power_On_Hours" | awk '{print $10}')
-        fi
-        
-        if [ ! -z "$TEMP" ]; then
-            echo "                    <div class=\"info-row\">"
-            echo "                        <span class=\"label\">温度:</span>"
-            echo "                        <span class=\"value\">${TEMP}°C</span>"
-            echo "                    </div>"
-        fi
-        
-        if [ ! -z "$POWER_ON" ]; then
-            POWER_ON_DAYS=$((POWER_ON / 24))
-            echo "                    <div class=\"info-row\">"
-            echo "                        <span class=\"label\">运行时长:</span>"
-            echo "                        <span class=\"value\">${POWER_ON} 小时 (${POWER_ON_DAYS} 天)</span>"
-            echo "                    </div>"
-        fi
-    fi
-    
-    echo "                    <div style=\"height: 10px;\"></div>"
-done
-
-echo "                </div>"
-
-cat << 'EOF'
-            </div>
-
-            <!-- 系统信息 -->
-            <div class="card">
-                <div class="card-title">系统信息</div>
-                <div class="card-content">
-EOF
-
-# 系统信息
-HOSTNAME=$(hostname)
-
-# 获取运行时间并格式化为天小时分秒
-UPTIME_SECONDS=$(cat /proc/uptime | awk '{print int($1)}')
-UPTIME_DAYS=$((UPTIME_SECONDS / 86400))
-UPTIME_HOURS=$(((UPTIME_SECONDS % 86400) / 3600))
-UPTIME_MINUTES=$(((UPTIME_SECONDS % 3600) / 60))
-UPTIME_SECS=$((UPTIME_SECONDS % 60))
-UPTIME="${UPTIME_DAYS}天 ${UPTIME_HOURS}小时 ${UPTIME_MINUTES}分 ${UPTIME_SECS}秒"
-
-OS=$(cat /etc/os-release 2>/dev/null | grep "^PRETTY_NAME" | cut -d'"' -f2)
-if [ -z "$OS" ]; then
-    OS=$(uname -s)
-fi
-
-echo "                    <div class=\"info-row\">"
-echo "                        <span class=\"label\">主机名:</span>"
-echo "                        <span class=\"value\">$HOSTNAME</span>"
-echo "                    </div>"
-
-echo "                    <div class=\"info-row\">"
-echo "                        <span class=\"label\">运行时间:</span>"
-echo "                        <span class=\"value\">$UPTIME</span>"
-echo "                    </div>"
-
-echo "                    <div class=\"info-row\">"
-echo "                        <span class=\"label\">操作系统:</span>"
-echo "                        <span class=\"value\">$OS</span>"
-echo "                    </div>"
-echo "                </div>"
-
-cat << 'EOF'
-            </div>
-        </div>
-
-        <!-- GPU 信息 -->
-EOF
-
-# GPU 信息（带超时保护，卡片方式显示）
-if command -v nvidia-smi >/dev/null 2>&1; then
-    # 获取GPU数量
-    GPU_COUNT=$(timeout 2 nvidia-smi --list-gpus 2>/dev/null | wc -l)
-    
-    if [ $? -eq 124 ] || [ -z "$GPU_COUNT" ] || [ "$GPU_COUNT" -eq 0 ]; then
-        echo "        <div class=\"card gpu-section\">"
-        echo "            <div class=\"card-title\">GPU 信息</div>"
-        echo "            <div class=\"info-row\">"
-        echo "                <span class=\"value\" style=\"color: #95a5a6;\">GPU 数据采集超时或无法检测</span>"
-        echo "            </div>"
-        echo "        </div>"
-    else
-        # GPU网格容器
-        echo "        <div class=\"gpu-grid\">"
-        # 遍历每个GPU
-        for GPU_ID in $(seq 0 $((GPU_COUNT - 1))); do
-            echo "            <div class=\"gpu-card\">"
-            echo "                <div class=\"card-title\">GPU $GPU_ID</div>"
-            
-            # 获取GPU基本信息
-            GPU_NAME=$(timeout 2 nvidia-smi -i $GPU_ID --query-gpu=name --format=csv,noheader 2>/dev/null)
-            GPU_TEMP=$(timeout 2 nvidia-smi -i $GPU_ID --query-gpu=temperature.gpu --format=csv,noheader 2>/dev/null)
-            GPU_UTIL=$(timeout 2 nvidia-smi -i $GPU_ID --query-gpu=utilization.gpu --format=csv,noheader 2>/dev/null | sed 's/ %//')
-            GPU_MEM_USED=$(timeout 2 nvidia-smi -i $GPU_ID --query-gpu=memory.used --format=csv,noheader 2>/dev/null)
-            GPU_MEM_TOTAL=$(timeout 2 nvidia-smi -i $GPU_ID --query-gpu=memory.total --format=csv,noheader 2>/dev/null)
-            GPU_POWER=$(timeout 2 nvidia-smi -i $GPU_ID --query-gpu=power.draw --format=csv,noheader 2>/dev/null)
-            GPU_PCIE_BUS=$(timeout 2 nvidia-smi -i $GPU_ID --query-gpu=pci.bus_id --format=csv,noheader 2>/dev/null)
-            
-            # 获取PCIe速率信息
-            GPU_PCIE_LINK=$(timeout 2 nvidia-smi -i $GPU_ID --query-gpu=pcie.link.gen.current,pcie.link.width.current --format=csv,noheader 2>/dev/null)
-            GPU_PCIE_MAX=$(timeout 2 nvidia-smi -i $GPU_ID --query-gpu=pcie.link.gen.max,pcie.link.width.max --format=csv,noheader 2>/dev/null)
-            
-            # 显示GPU型号
-            if [ ! -z "$GPU_NAME" ]; then
-                echo "            <div class=\"info-row\">"
-                echo "                <span class=\"label\">型号:</span>"
-                echo "                <span class=\"value\">$GPU_NAME</span>"
-                echo "            </div>"
-            fi
-            
-            # 显示PCIe地址
-            if [ ! -z "$GPU_PCIE_BUS" ]; then
-                echo "            <div class=\"info-row\">"
-                echo "                <span class=\"label\">PCIe 地址:</span>"
-                echo "                <span class=\"value\">$GPU_PCIE_BUS</span>"
-                echo "            </div>"
-            fi
-            
-            # 显示PCIe速率
-            if [ ! -z "$GPU_PCIE_LINK" ]; then
-                PCIE_GEN=$(echo $GPU_PCIE_LINK | awk -F',' '{print $1}' | xargs)
-                PCIE_WIDTH=$(echo $GPU_PCIE_LINK | awk -F',' '{print $2}' | xargs)
-                echo "            <div class=\"info-row\">"
-                echo "                <span class=\"label\">当前PCIe 速率:</span>"
-                echo "                <span class=\"value\">Gen${PCIE_GEN} x${PCIE_WIDTH}</span>"
-                echo "            </div>"
-            fi
-            
-            # 显示PCIe最大速率
-            if [ ! -z "$GPU_PCIE_MAX" ]; then
-                PCIE_GEN_MAX=$(echo $GPU_PCIE_MAX | awk -F',' '{print $1}' | xargs)
-                PCIE_WIDTH_MAX=$(echo $GPU_PCIE_MAX | awk -F',' '{print $2}' | xargs)
-                echo "            <div class=\"info-row\">"
-                echo "                <span class=\"label\">PCIe 最大:</span>"
-                echo "                <span class=\"value\">Gen${PCIE_GEN_MAX} x${PCIE_WIDTH_MAX}</span>"
-                echo "            </div>"
-            fi
-            
-            # 显示温度
-            if [ ! -z "$GPU_TEMP" ]; then
-                echo "            <div class=\"info-row\">"
-                echo "                <span class=\"label\">温度:</span>"
-                echo "                <span class=\"value\">${GPU_TEMP}°C</span>"
-                echo "            </div>"
-            fi
-            
-            # 显示GPU使用率
-            if [ ! -z "$GPU_UTIL" ]; then
-                GPU_UTIL_INT=$(echo $GPU_UTIL | awk '{print int($1)}')
-                GPU_CLASS=""
-                if [ $GPU_UTIL_INT -gt 80 ]; then
-                    GPU_CLASS="danger"
-                elif [ $GPU_UTIL_INT -gt 60 ]; then
-                    GPU_CLASS="warning"
-                fi
-                
-                echo "            <div class=\"info-row\">"
-                echo "                <span class=\"label\">GPU 使用率:</span>"
-                echo "            </div>"
-                echo "            <div class=\"progress-bar\">"
-                echo "                <div class=\"progress-fill $GPU_CLASS\" style=\"width: ${GPU_UTIL_INT}%\">${GPU_UTIL}%</div>"
-                echo "            </div>"
-            fi
-            
-            # 显示显存使用
-            if [ ! -z "$GPU_MEM_USED" ] && [ ! -z "$GPU_MEM_TOTAL" ]; then
-                MEM_USED_NUM=$(echo $GPU_MEM_USED | sed 's/ MiB//')
-                MEM_TOTAL_NUM=$(echo $GPU_MEM_TOTAL | sed 's/ MiB//')
-                MEM_PERCENT=$(awk "BEGIN {printf \"%.0f\", ($MEM_USED_NUM/$MEM_TOTAL_NUM)*100}")
-                
-                MEM_CLASS=""
-                if [ $MEM_PERCENT -gt 80 ]; then
-                    MEM_CLASS="danger"
-                elif [ $MEM_PERCENT -gt 60 ]; then
-                    MEM_CLASS="warning"
-                fi
-                
-                echo "            <div class=\"info-row\">"
-                echo "                <span class=\"label\">显存:</span>"
-                echo "                <span class=\"value\">$GPU_MEM_USED / $GPU_MEM_TOTAL</span>"
-                echo "            </div>"
-                echo "            <div class=\"progress-bar\">"
-                echo "                <div class=\"progress-fill $MEM_CLASS\" style=\"width: ${MEM_PERCENT}%\">${MEM_PERCENT}%</div>"
-                echo "            </div>"
-            fi
-            
-            # 显示功耗
-            if [ ! -z "$GPU_POWER" ]; then
-                echo "            <div class=\"info-row\">"
-                echo "                <span class=\"label\">功耗:</span>"
-                echo "                <span class=\"value\">$GPU_POWER</span>"
-                echo "            </div>"
-            fi
-            
-            echo "            </div>"
-        done
-        echo "        </div>"
-    fi
-else
-    echo "        <div class=\"card gpu-section\">"
-    echo "            <div class=\"card-title\">GPU 信息</div>"
-    echo "            <div class=\"info-row\">"
-    echo "                <span class=\"value\" style=\"color: #95a5a6;\">未检测到 NVIDIA GPU 或 nvidia-smi 未安装</span>"
-    echo "            </div>"
-    echo "        </div>"
-fi
-
-cat << 'EOF'
-
-        <div class="refresh-info">
-            页面每 60 秒自动刷新一次
         </div>
     </div>
-
-    <script>
-        setTimeout(function() {
-            location.reload();
-        }, 60000);
-    </script>
+    <div class="disk-overview card">
+        <div class="card-title" style="margin-bottom:25px">💾 磁盘信息</div>
+        <div class="overview-grid">
+            <div class="overview-section">
+                <div class="section-header">🔍 物理磁盘健康度</div>
+                <div id="diskHealth"></div>
+            </div>
+            <div class="overview-section">
+                <div class="section-header">📂 磁盘分区使用情况</div>
+                <div id="diskPartitions"></div>
+            </div>
+        </div>
+    </div>
+    <div class="gpu-grid" id="gpuGrid"></div>
+</div>
+<script>
+var DATA=
+HTMLSTART
+    
+    echo "$DATA"
+    
+    cat << 'HTMLEND'
+;
+function pc(v){v=parseFloat(v);return v>80?'danger':v>60?'warn':'';}
+var gpuCards=[];
+function render(d){
+    document.getElementById('cpu').innerHTML='<div class="row"><span class="label">处理器</span><span class="value">'+d.cpu.model+'</span></div><div class="row"><span class="label">核心数</span><span class="value">'+d.cpu.cores+' 核</span></div><div class="prog-section"><div class="prog-header"><span class="label">使用率</span><span class="value">'+d.cpu.usage+'%</span></div><div class="prog-bar"><div class="prog-fill '+pc(d.cpu.usage)+'" style="width:'+d.cpu.usage+'%"></div></div></div>';
+    document.getElementById('mem').innerHTML='<div class="row"><span class="label">总容量</span><span class="value">'+d.mem.total+'</span></div><div class="row"><span class="label">已使用</span><span class="value">'+d.mem.used+'</span></div><div class="row"><span class="label">可用</span><span class="value">'+d.mem.free+'</span></div><div class="prog-section"><div class="prog-header"><span class="label">使用率</span><span class="value">'+d.mem.pct+'%</span></div><div class="prog-bar"><div class="prog-fill '+pc(d.mem.pct)+'" style="width:'+d.mem.pct+'%"></div></div></div>';
+    var uptimeStr=d.sys.uptime;
+    var uptimeMatch=uptimeStr.match(/(\d+)\s*hour[s]?,\s*(\d+)\s*minute[s]?/);
+    if(!uptimeMatch){uptimeMatch=uptimeStr.match(/up\s+(\d+)\s*hour[s]?,\s*(\d+)\s*minute[s]?/);}
+    var days=0,hours=0,minutes=0;
+    if(uptimeMatch){
+        hours=parseInt(uptimeMatch[1])||0;
+        minutes=parseInt(uptimeMatch[2])||0;
+        days=Math.floor(hours/24);
+        hours=hours%24;
+    }else{
+        var dayMatch=uptimeStr.match(/(\d+)\s*day[s]?/);
+        var hourMatch=uptimeStr.match(/(\d+)\s*hour[s]?/);
+        var minMatch=uptimeStr.match(/(\d+)\s*minute[s]?/);
+        if(dayMatch)days=parseInt(dayMatch[1])||0;
+        if(hourMatch)hours=parseInt(hourMatch[1])||0;
+        if(minMatch)minutes=parseInt(minMatch[1])||0;
+    }
+    var uptimeFormatted=days+'天'+hours+'时'+minutes+'分';
+    document.getElementById('sys').innerHTML='<div class="row"><span class="label">操作系统</span><span class="value">'+d.sys.os+'</span></div><div class="row"><span class="label">运行时间</span><span class="value">'+uptimeFormatted+'</span></div>';
+    var healthHtml='';
+    if(d.disks&&d.disks.length>0){
+        d.disks.forEach(function(disk){
+            var healthColor=disk.health==='PASSED'?'#10b981':'#ef4444';
+            var healthIcon=disk.health==='PASSED'?'✓':'✗';
+            var pctColor=disk.healthPct>=80?'#10b981':disk.healthPct>=60?'#f59e0b':'#ef4444';
+            var hours=parseInt(disk.hours);
+            var years=Math.floor(hours/24/365);
+            var months=Math.floor((hours-years*365*24)/24/30);
+            var days=Math.floor((hours-years*365*24-months*30*24)/24);
+            var runtimeStr=years+'年'+months+'月'+days+'天';
+            healthHtml+='<div style="margin-bottom:20px;padding-bottom:15px;border-bottom:1px solid rgba(255,255,255,.05)"><div class="row"><span class="label" style="font-weight:600;color:#4fd1c5">/dev/'+disk.disk+'</span><span class="value" style="color:'+healthColor+'">'+healthIcon+' '+disk.health+'</span></div><div class="row"><span class="label">型号</span><span class="value">'+disk.model+'</span></div><div class="row"><span class="label">健康度</span><span class="value" style="color:'+pctColor+'">'+disk.healthPct+'%</span></div><div class="row"><span class="label">运行时间</span><span class="value">'+disk.hours+' 小时 ('+runtimeStr+')</span></div><div class="row"><span class="label">温度</span><span class="value">'+(disk.temp!=='N/A'?disk.temp+'°C':disk.temp)+'</span></div></div>';
+        });
+    }else{
+        healthHtml='<div class="row"><span class="value" style="color:#64748b">暂无数据</span></div>';
+    }
+    document.getElementById('diskHealth').innerHTML=healthHtml;
+    var partHtml='';
+    if(d.partitions&&d.partitions.length>0){
+        d.partitions.forEach(function(p){
+            partHtml+='<div style="margin-bottom:15px"><div class="row"><span class="label">'+p.mount+'</span><span class="value">'+p.dev+'</span></div><div class="row"><span class="label">容量</span><span class="value">'+p.size+' (已用 '+p.used+')</span></div><div class="prog-section"><div class="prog-header"><span class="label">使用率</span><span class="value">'+p.pct+'%</span></div><div class="prog-bar"><div class="prog-fill '+pc(p.pct)+'" style="width:'+p.pct+'%"></div></div></div></div>';
+        });
+    }else{
+        partHtml='<div class="row"><span class="value" style="color:#64748b">暂无数据</span></div>';
+    }
+    document.getElementById('diskPartitions').innerHTML=partHtml;
+    if(d.gpus&&d.gpus.length>0){
+        var grid=document.getElementById('gpuGrid');
+        if(gpuCards.length===0){
+            d.gpus.forEach(function(g,i){
+                var card=document.createElement('div');
+                card.className='card';
+                card.id='gpuCard'+i;
+                card.innerHTML='<div class="card-title"><div class="card-icon gpu">🎮</div>GPU '+g.idx+': '+g.name+'</div><div id="gpuContent'+i+'"></div>';
+                grid.appendChild(card);
+                gpuCards.push(card);
+            });
+        }
+        d.gpus.forEach(function(g,i){
+            var pciSpeed='PCIe '+g.pciGenCur+'.0 x'+g.pciWidthCur;
+            var pciMax='PCIe '+g.pciGenMax+'.0 x'+g.pciWidthMax;
+            document.getElementById('gpuContent'+i).innerHTML='<div class="row"><span class="label">PCIe 地址</span><span class="value">'+g.pciBus+'</span></div><div class="row"><span class="label">当前速率</span><span class="value">'+pciSpeed+'</span></div><div class="row"><span class="label">最大速率</span><span class="value">'+pciMax+'</span></div><div class="row"><span class="label">驱动版本</span><span class="value">'+g.driver+'</span></div><div class="row"><span class="label">温度</span><span class="value">'+g.temp+'°C</span></div><div class="row"><span class="label">功耗</span><span class="value">'+g.power+' W</span></div><div class="prog-section"><div class="prog-header"><span class="label">GPU 使用率</span><span class="value">'+g.util+'%</span></div><div class="prog-bar"><div class="prog-fill '+pc(g.util)+'" style="width:'+g.util+'%"></div></div></div><div class="prog-section"><div class="prog-header"><span class="label">显存 ('+g.memUsed+'M / '+g.memTotal+'M)</span><span class="value">'+g.memPct+'%</span></div><div class="prog-bar"><div class="prog-fill '+pc(g.memPct)+'" style="width:'+g.memPct+'%"></div></div></div>';
+        });
+    }
+}
+render(DATA);
+</script>
 </body>
 </html>
-EOF
+HTMLEND
 }
 
 while true; do
     generate_page | nc -l -p $PORT -q 1 > /dev/null 2>&1
 done
-MONITOR_SCRIPT_EOF
+MONITOR_EOF
 
-chmod +x "$INSTALL_DIR/monitor.sh" >> "$LOG_FILE" 2>&1
-echo ""
+    chmod +x "$INSTALL_DIR/monitor.sh"
+}
 
-# 5. 启动服务 (100%)
-show_progress 5 5 "启动服务..."
-{
-    cat > "$SERVICE_FILE" << 'EOF'
+# 创建systemd服务
+create_service() {
+    echo "创建systemd服务..."
+    
+    cat > /etc/systemd/system/system-monitor.service << EOF
 [Unit]
 Description=System Monitor Web Dashboard
 After=network.target
 
 [Service]
 Type=simple
-User=root
-WorkingDirectory=/opt/system-monitor
-ExecStart=/bin/bash /opt/system-monitor/monitor.sh
+ExecStart=/bin/bash $INSTALL_DIR/monitor.sh
 Restart=always
-RestartSec=10
-StandardOutput=journal
-StandardError=journal
+RestartSec=5
+StandardOutput=append:$LOG_FILE
+StandardError=append:$LOG_FILE
 
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload >> "$LOG_FILE" 2>&1
-    systemctl enable system-monitor >> "$LOG_FILE" 2>&1
-    systemctl start system-monitor >> "$LOG_FILE" 2>&1
-    sleep 2
-} &
-wait $!
-echo ""
 
-# 检查服务状态
-if systemctl is-active --quiet system-monitor; then
-    echo ""
-    echo "=========================================="
-    echo "  ✓ 安装完成！"
-    echo "=========================================="
-    echo ""
-    echo "访问地址: http://$(hostname -I | awk '{print $1}'):8888"
-    echo "本地访问: http://localhost:8888"
-    echo ""
-    echo "查看状态: systemctl status system-monitor"
-    echo "查看日志: journalctl -u system-monitor -f"
-    echo ""
-else
-    echo ""
-    echo "=========================================="
-    echo "  ✗ 安装失败"
-    echo "=========================================="
-    echo ""
-    echo "查看日志: cat $LOG_FILE"
-    exit 1
-fi
+    systemctl daemon-reload
+}
+
+# 主安装流程
+main() {
+    # 1. 清理端口占用
+    cleanup_port
+    
+    # 2. 安装依赖
+    install_dependencies
+    
+    # 3. 停止旧服务
+    echo "停止旧服务..."
+    systemctl is-active --quiet system-monitor && systemctl stop system-monitor 2>/dev/null || true
+    
+    # 4. 创建监控脚本
+    create_monitor_script
+    
+    # 5. 创建systemd服务
+    create_service
+    
+    # 6. 启动服务
+    echo "启动系统监控服务..."
+    systemctl enable system-monitor
+    systemctl start system-monitor
+    
+    # 7. 等待服务启动
+    sleep 2
+    
+    # 8. 检查服务状态
+    if systemctl is-active --quiet system-monitor; then
+        echo ""
+        echo "========================================="
+        echo "  ✅ 安装成功！"
+        echo "========================================="
+        echo ""
+        echo "访问地址: http://$(hostname -I | awk '{print $1}'):8888"
+        echo ""
+        echo "常用命令:"
+        echo "  查看状态: systemctl status system-monitor"
+        echo "  查看日志: tail -f $LOG_FILE"
+        echo "  重启服务: systemctl restart system-monitor"
+        echo "  停止服务: systemctl stop system-monitor"
+        echo ""
+        echo "特性:"
+        echo "  - 每30分钟自动检查并安装依赖"
+        echo "  - 日志自动轮转（限制10MB）"
+        echo "  - 端口冲突自动清理"
+        echo ""
+    else
+        echo ""
+        echo "❌ 服务启动失败，请查看日志: tail -f $LOG_FILE"
+        exit 1
+    fi
+}
+
+# 执行安装
+main
