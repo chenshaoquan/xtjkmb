@@ -87,26 +87,114 @@ cat > "$INSTALL_DIR/monitor.sh" << 'MONITOR_SCRIPT_EOF'
 #!/bin/sh
 
 PORT=8888
+LOG_FILE="/var/log/system-monitor.log"
+SMARTCTL_CHECK_FILE="/var/run/system-monitor-smartctl-check"
+SMARTCTL_INSTALL_LOCK="/var/run/system-monitor-smartctl-install.lock"
 
-# 检查并安装 smartmontools
-if ! command -v smartctl >/dev/null 2>&1; then
-    echo "smartmontools not found, installing..."
-    if command -v apt-get >/dev/null 2>&1; then
-        apt-get update -qq && apt-get install -y smartmontools >/dev/null 2>&1
-    elif command -v yum >/dev/null 2>&1; then
-        yum install -y smartmontools >/dev/null 2>&1
-    elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y smartmontools >/dev/null 2>&1
-    elif command -v pacman >/dev/null 2>&1; then
-        pacman -S --noconfirm smartmontools >/dev/null 2>&1
-    else
-        echo "Warning: Could not install smartmontools automatically. Please install manually."
+# 日志轮转函数
+rotate_log() {
+    if [ -f "$LOG_FILE" ]; then
+        LOG_SIZE=$(stat -c%s "$LOG_FILE" 2>/dev/null || stat -f%z "$LOG_FILE" 2>/dev/null || echo 0)
+        if [ "$LOG_SIZE" -gt 10485760 ]; then  # 10MB
+            tail -n 1000 "$LOG_FILE" > "${LOG_FILE}.tmp"
+            mv "${LOG_FILE}.tmp" "$LOG_FILE"
+        fi
+    fi
+}
+
+# 安装 smartmontools 函数
+install_smartmontools() {
+    # 检查是否有其他进程正在安装
+    if [ -f "$SMARTCTL_INSTALL_LOCK" ]; then
+        LOCK_AGE=$(($(date +%s) - $(stat -c%Y "$SMARTCTL_INSTALL_LOCK" 2>/dev/null || echo 0)))
+        if [ $LOCK_AGE -lt 300 ]; then  # 5分钟内的锁有效
+            echo "Another installation process is running, skipping..." | tee -a "$LOG_FILE"
+            return 1
+        else
+            # 锁文件过期，删除
+            rm -f "$SMARTCTL_INSTALL_LOCK"
+        fi
     fi
     
+    # 创建锁文件
+    touch "$SMARTCTL_INSTALL_LOCK"
+    
+    echo "smartmontools not found, installing..." | tee -a "$LOG_FILE"
+    
+    # 尝试5次安装
+    for attempt in 1 2 3 4 5; do
+        echo "Installation attempt $attempt/5..." | tee -a "$LOG_FILE"
+        
+        if command -v apt-get >/dev/null 2>&1; then
+            apt-get update -qq >> "$LOG_FILE" 2>&1
+            if apt-get install -y smartmontools >> "$LOG_FILE" 2>&1; then
+                break
+            fi
+        elif command -v yum >/dev/null 2>&1; then
+            if yum install -y smartmontools >> "$LOG_FILE" 2>&1; then
+                break
+            fi
+        elif command -v dnf >/dev/null 2>&1; then
+            if dnf install -y smartmontools >> "$LOG_FILE" 2>&1; then
+                break
+            fi
+        elif command -v pacman >/dev/null 2>&1; then
+            if pacman -S --noconfirm smartmontools >> "$LOG_FILE" 2>&1; then
+                break
+            fi
+        fi
+        
+        if [ $attempt -lt 5 ]; then
+            echo "Installation attempt $attempt failed, retrying in 3 seconds..." | tee -a "$LOG_FILE"
+            sleep 3
+        fi
+    done
+    
+    # 删除锁文件
+    rm -f "$SMARTCTL_INSTALL_LOCK"
+    
+    # 验证安装
     if command -v smartctl >/dev/null 2>&1; then
-        echo "smartmontools installed successfully."
+        echo "smartmontools installed successfully." | tee -a "$LOG_FILE"
+        touch "$SMARTCTL_CHECK_FILE"
+        return 0
+    else
+        echo "Warning: Failed to install smartmontools after 5 attempts." | tee -a "$LOG_FILE"
+        return 1
     fi
+}
+
+# 定时检测 smartmontools 函数
+check_smartmontools() {
+    # 如果已安装，更新检查时间戳
+    if command -v smartctl >/dev/null 2>&1; then
+        touch "$SMARTCTL_CHECK_FILE"
+        return 0
+    fi
+    
+    # 检查上次检测时间
+    if [ -f "$SMARTCTL_CHECK_FILE" ]; then
+        LAST_CHECK=$(stat -c%Y "$SMARTCTL_CHECK_FILE" 2>/dev/null || echo 0)
+        CURRENT_TIME=$(date +%s)
+        TIME_DIFF=$((CURRENT_TIME - LAST_CHECK))
+        
+        # 每30分钟检测一次
+        if [ $TIME_DIFF -lt 1800 ]; then
+            return 1
+        fi
+    fi
+    
+    # 尝试安装
+    install_smartmontools
+}
+
+# 首次运行时检查并安装 smartmontools
+if ! command -v smartctl >/dev/null 2>&1; then
+    install_smartmontools
 fi
+
+# 执行日志轮转
+rotate_log
 
 echo "Checking if port $PORT is in use..."
 PID=$(lsof -ti:$PORT)
@@ -120,6 +208,9 @@ fi
 echo "Starting web monitoring server on port $PORT..."
 
 generate_page() {
+    # 定时检测smartmontools（每30分钟）
+    check_smartmontools &
+    
     echo "HTTP/1.1 200 OK"
     echo "Content-Type: text/html; charset=UTF-8"
     echo "Cache-Control: no-cache"
