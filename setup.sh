@@ -869,9 +869,7 @@ cat << 'EOF'
         
         function handleReboot() {
             if (confirm('确定要重启系统吗？')) {
-                fetch('/reboot', {method: 'POST'})
-                    .then(() => alert('重启命令已发送'))
-                    .catch(err => alert('重启失败: ' + err));
+                window.location.href = '/action/reboot';
             }
         }
         
@@ -879,9 +877,7 @@ cat << 'EOF'
             if (confirm('第一次确认：确定要关机吗？')) {
                 if (confirm('第二次确认：真的要关机吗？')) {
                     if (confirm('第三次确认：最后确认，确定关机？')) {
-                        fetch('/shutdown', {method: 'POST'})
-                            .then(() => alert('关机命令已发送'))
-                            .catch(err => alert('关机失败: ' + err));
+                        window.location.href = '/action/shutdown';
                     }
                 }
             }
@@ -893,56 +889,28 @@ EOF
 }
 
 while true; do
-    # 使用命名管道处理请求
-    REQUEST=$(mktemp)
-    RESPONSE=$(mktemp)
+    # 临时文件存储请求
+    REQUEST_FILE="/tmp/monitor-request-$$"
+    rm -f "$REQUEST_FILE"
     
-    # 接收请求
-    nc -l -p $PORT > "$REQUEST" 2>/dev/null &
-    NC_PID=$!
-    sleep 0.3
+    # 发送页面并捕获请求（使用-q 1代替-w）
+    generate_page | nc -l -p $PORT -q 1 > "$REQUEST_FILE" 2>/dev/null
     
     # 读取请求的第一行
-    REQUEST_LINE=$(head -1 "$REQUEST" 2>/dev/null)
+    REQUEST_LINE=$(head -1 "$REQUEST_FILE" 2>/dev/null)
+    rm -f "$REQUEST_FILE"
     
-    # 检查是否是POST请求
-    if echo "$REQUEST_LINE" | grep -q "POST /reboot"; then
-        # 重启命令
-        {
-            echo "HTTP/1.1 200 OK"
-            echo "Content-Type: text/plain"
-            echo "Connection: close"
-            echo ""
-            echo "Reboot command executed"
-        } > "$RESPONSE"
-        cat "$RESPONSE" | nc -l -p $PORT -w 1 > /dev/null 2>&1
-        rm -f "$REQUEST" "$RESPONSE"
-        # 延迟2秒后执行重启
-        (sleep 2 && reboot) &
-        continue
-    elif echo "$REQUEST_LINE" | grep -q "POST /shutdown"; then
-        # 关机命令
-        {
-            echo "HTTP/1.1 200 OK"
-            echo "Content-Type: text/plain"
-            echo "Connection: close"
-            echo ""
-            echo "Shutdown command executed"
-        } > "$RESPONSE"
-        cat "$RESPONSE" | nc -l -p $PORT -w 1 > /dev/null 2>&1
-        rm -f "$REQUEST" "$RESPONSE"
-        # 延迟2秒后执行关机
-        (sleep 2 && sudo poweroff) &
-        continue
+    # 检查是否是重启请求
+    if echo "$REQUEST_LINE" | grep -q "GET /action/reboot"; then
+        reboot
+        exit 0
     fi
     
-    # 正常的GET请求，返回监控页面
-    generate_page | nc -l -p $PORT -w 3 > /dev/null 2>&1
-    
-    # 清理临时文件
-    rm -f "$REQUEST" "$RESPONSE"
-    kill $NC_PID 2>/dev/null
-    wait $NC_PID 2>/dev/null
+    # 检查是否是关机请求
+    if echo "$REQUEST_LINE" | grep -q "GET /action/shutdown"; then
+        sudo poweroff
+        exit 0
+    fi
 done
 MONITOR_SCRIPT_EOF
 
