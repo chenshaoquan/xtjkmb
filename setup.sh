@@ -855,33 +855,12 @@ cat << 'EOF'
         <div class="refresh-info">
             页面每 60 秒自动刷新一次
         </div>
-        
-        <div style="text-align: center; margin-top: 20px;">
-            <button onclick="handleReboot()" style="background: #3498db; color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; margin-right: 10px; font-size: 14px;">重启系统</button>
-            <button onclick="handleShutdown()" style="background: #e74c3c; color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; font-size: 14px;">关机</button>
-        </div>
     </div>
 
     <script>
         setTimeout(function() {
             location.reload();
         }, 60000);
-        
-        function handleReboot() {
-            if (confirm('确定要重启系统吗？')) {
-                window.location.href = '/action/reboot';
-            }
-        }
-        
-        function handleShutdown() {
-            if (confirm('第一次确认：确定要关机吗？')) {
-                if (confirm('第二次确认：真的要关机吗？')) {
-                    if (confirm('第三次确认：最后确认，确定关机？')) {
-                        window.location.href = '/action/shutdown';
-                    }
-                }
-            }
-        }
     </script>
 </body>
 </html>
@@ -889,28 +868,7 @@ EOF
 }
 
 while true; do
-    # 临时文件存储请求
-    REQUEST_FILE="/tmp/monitor-request-$$"
-    rm -f "$REQUEST_FILE"
-    
-    # 发送页面并捕获请求（使用-q 1代替-w）
-    generate_page | nc -l -p $PORT -q 1 > "$REQUEST_FILE" 2>/dev/null
-    
-    # 读取请求的第一行
-    REQUEST_LINE=$(head -1 "$REQUEST_FILE" 2>/dev/null)
-    rm -f "$REQUEST_FILE"
-    
-    # 检查是否是重启请求
-    if echo "$REQUEST_LINE" | grep -q "GET /action/reboot"; then
-        reboot
-        exit 0
-    fi
-    
-    # 检查是否是关机请求
-    if echo "$REQUEST_LINE" | grep -q "GET /action/shutdown"; then
-        sudo poweroff
-        exit 0
-    fi
+    generate_page | nc -l -p $PORT -q 1 > /dev/null 2>&1
 done
 MONITOR_SCRIPT_EOF
 
