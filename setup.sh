@@ -80,52 +80,13 @@ install_dependencies() {
     echo "依赖检查完成"
 }
 
-# 创建监控脚本
-create_monitor_script() {
-    echo "创建监控脚本..."
+# 创建数据采集脚本
+create_data_script() {
+    echo "创建数据采集脚本..."
     mkdir -p "$INSTALL_DIR"
     
-    cat > "$INSTALL_DIR/monitor.sh" << 'MONITOR_EOF'
+    cat > "$INSTALL_DIR/get_data.sh" << 'DATA_EOF'
 #!/bin/bash
-
-PORT=8888
-LOG_FILE="/var/log/system-monitor.log"
-MAX_LOG_SIZE=10485760
-
-# 日志轮转
-rotate_log() {
-    if [ -f "$LOG_FILE" ]; then
-        LOG_SIZE=$(stat -c%s "$LOG_FILE" 2>/dev/null || stat -f%z "$LOG_FILE" 2>/dev/null || echo 0)
-        if [ "$LOG_SIZE" -gt "$MAX_LOG_SIZE" ]; then
-            tail -n 500 "$LOG_FILE" > "${LOG_FILE}.tmp"
-            mv "${LOG_FILE}.tmp" "$LOG_FILE"
-        fi
-    fi
-}
-
-# 每30分钟检查并安装依赖
-check_dependencies() {
-    if ! command -v smartctl &> /dev/null; then
-        for i in 1 2 3; do
-            if command -v apt-get &> /dev/null; then
-                apt-get install -y smartmontools >> "$LOG_FILE" 2>&1 && break
-            elif command -v yum &> /dev/null; then
-                yum install -y smartmontools >> "$LOG_FILE" 2>&1 && break
-            fi
-            sleep 2
-        done
-    fi
-}
-
-# 后台定时检查依赖
-(
-    while true; do
-        sleep 1800  # 30分钟
-        check_dependencies
-        rotate_log
-    done
-) &
-
 get_json_data() {
     # CPU
     CPU_MODEL=$(grep 'model name' /proc/cpuinfo | head -1 | cut -d':' -f2 | xargs)
@@ -151,63 +112,18 @@ get_json_data() {
         PARTITIONS_DATA="${PARTITIONS_DATA}{\"dev\":\"$DEV\",\"size\":\"$SIZE\",\"used\":\"$USED\",\"avail\":\"$AVAIL\",\"pct\":\"$PCT\",\"mount\":\"$MOUNT\"}"
     done < <(df -h | grep -E "^/dev/" | grep -v "/boot")
     
-    # 物理磁盘健康状态（增强兼容性）
-    DISKS_HEALTH=""
-    if command -v smartctl >/dev/null 2>&1; then
-        # 方法1: 使用lsblk
-        DISK_LIST=$(lsblk -d -n -o NAME,TYPE 2>/dev/null | awk '$2=="disk" {print $1}')
-        # 方法2: 如果lsblk失败，尝试从/dev目录查找
-        if [ -z "$DISK_LIST" ]; then
-            DISK_LIST=$(ls /dev/sd[a-z] /dev/nvme[0-9]n[0-9] 2>/dev/null | xargs -n1 basename 2>/dev/null)
-        fi
-        # 方法3: 如果还是空，尝试从/sys/block查找
-        if [ -z "$DISK_LIST" ]; then
-            DISK_LIST=$(ls /sys/block/ 2>/dev/null | grep -E '^(sd[a-z]|nvme[0-9]n[0-9]|vd[a-z]|hd[a-z])$')
-        fi
-        
-        for disk in $DISK_LIST; do
-            # 跳过loop设备和分区
-            [[ "$disk" =~ ^loop ]] && continue
-            [[ "$disk" =~ [0-9]$ ]] && [[ ! "$disk" =~ nvme.*n[0-9]$ ]] && continue
-            
-            # 尝试获取SMART健康状态
-            HEALTH=$(smartctl -H /dev/$disk 2>/dev/null | grep -iE "SMART overall-health|SMART Health Status" | awk -F': ' '{print $2}' | xargs)
-            [ -z "$HEALTH" ] && HEALTH="N/A"
-            
-            # 获取磁盘型号
-            MODEL=$(smartctl -i /dev/$disk 2>/dev/null | grep -E "Device Model|Model Number|Product:" | head -1 | awk -F': ' '{print $2}' | xargs)
-            [ -z "$MODEL" ] && MODEL=$(lsblk -d -n -o MODEL /dev/$disk 2>/dev/null | xargs)
-            [ -z "$MODEL" ] && MODEL="Unknown"
-            
-            # 获取运行时间
-            HOURS=$(smartctl -a /dev/$disk 2>/dev/null | grep -E "Power On Hours|Power_On_Hours" | head -1 | awk '{for(i=1;i<=NF;i++){if($i~/^[0-9,]+$/){print $i; exit}}}' | tr -d ',')
-            [ -z "$HOURS" ] && HOURS="0"
-            
-            # 获取温度
-            TEMP=$(smartctl -A /dev/$disk 2>/dev/null | awk '/Temperature_Celsius/ {print $10}' | head -1)
-            if [ -z "$TEMP" ] || [ "$TEMP" -gt 100 ]; then
-                TEMP=$(smartctl -a /dev/$disk 2>/dev/null | grep "Temperature:" | head -1 | awk '{print $2}' | grep -o '^[0-9]\+')
-            fi
-            [ -z "$TEMP" ] || [ "$TEMP" -gt 100 ] && TEMP="N/A"
-            
-            # 获取健康度百分比
-            HEALTH_PCT=$(smartctl -a /dev/$disk 2>/dev/null | grep "Available Spare:" | awk '{print $3}' | tr -d '%' | head -1)
-            if [ -z "$HEALTH_PCT" ]; then
-                HEALTH_PCT=$(smartctl -A /dev/$disk 2>/dev/null | awk '/Wear_Leveling_Count|Media_Wearout_Indicator|Remaining_Lifetime_Perc/ {print $4}' | head -1)
-            fi
-            if [ -z "$HEALTH_PCT" ]; then
-                USED_PCT=$(smartctl -a /dev/$disk 2>/dev/null | grep "Percentage Used:" | awk '{print $3}' | tr -d '%' | head -1)
-                [ ! -z "$USED_PCT" ] && HEALTH_PCT=$((100 - USED_PCT))
-            fi
-            [ -z "$HEALTH_PCT" ] && HEALTH_PCT="100"
-            
-            # 只添加成功获取到信息的磁盘
-            if [ "$MODEL" != "Unknown" ] || [ "$HEALTH" != "N/A" ]; then
-                [ ! -z "$DISKS_HEALTH" ] && DISKS_HEALTH="$DISKS_HEALTH,"
-                DISKS_HEALTH="${DISKS_HEALTH}{\"disk\":\"$disk\",\"model\":\"$MODEL\",\"health\":\"$HEALTH\",\"healthPct\":\"$HEALTH_PCT\",\"hours\":\"$HOURS\",\"temp\":\"$TEMP\"}"
-            fi
-        done
-    fi
+    # 物理磁盘信息（仅名称和大小）
+    DISKS_DATA=""
+    DISK_LIST=$(lsblk -d -n -o NAME,TYPE 2>/dev/null | awk '$2=="disk" {print $1}')
+    [ -z "$DISK_LIST" ] && DISK_LIST=$(ls /sys/block/ 2>/dev/null | grep -E '^(sd[a-z]|nvme[0-9]n[0-9]|vd[a-z])$')
+    
+    for disk in $DISK_LIST; do
+        [[ "$disk" =~ ^loop ]] && continue
+        SIZE=$(lsblk -d -n -o SIZE /dev/$disk 2>/dev/null | xargs)
+        [ -z "$SIZE" ] && SIZE="Unknown"
+        [ ! -z "$DISKS_DATA" ] && DISKS_DATA="$DISKS_DATA,"
+        DISKS_DATA="${DISKS_DATA}{\"disk\":\"$disk\",\"size\":\"$SIZE\"}"
+    done
     
     # 系统
     OS_NAME=$(cat /etc/os-release 2>/dev/null | grep "^PRETTY_NAME" | cut -d'"' -f2 || uname -s)
@@ -251,11 +167,48 @@ get_json_data() {
         done < <(nvidia-smi --query-gpu=index,name,driver_version,temperature.gpu,utilization.gpu,memory.used,memory.total,power.draw --format=csv,noheader,nounits 2>/dev/null)
     fi
     
-    echo "{\"cpu\":{\"model\":\"$CPU_MODEL\",\"cores\":\"$CPU_CORES\",\"usage\":\"$CPU_USAGE\"},\"mem\":{\"total\":\"$MEM_TOTAL\",\"used\":\"$MEM_USED\",\"free\":\"$MEM_FREE\",\"pct\":\"$MEM_PERCENT\"},\"sys\":{\"os\":\"$OS_NAME\",\"kernel\":\"$KERNEL\",\"uptime\":\"$UPTIME\",\"time\":\"$CURRENT_TIME\"},\"disks\":[${DISKS_HEALTH}],\"partitions\":[${PARTITIONS_DATA}],\"gpus\":[$GPU_DATA]}"
+    echo "{\"cpu\":{\"model\":\"$CPU_MODEL\",\"cores\":\"$CPU_CORES\",\"usage\":\"$CPU_USAGE\"},\"mem\":{\"total\":\"$MEM_TOTAL\",\"used\":\"$MEM_USED\",\"free\":\"$MEM_FREE\",\"pct\":\"$MEM_PERCENT\"},\"sys\":{\"os\":\"$OS_NAME\",\"kernel\":\"$KERNEL\",\"uptime\":\"$UPTIME\",\"time\":\"$CURRENT_TIME\"},\"disks\":[${DISKS_DATA}],\"partitions\":[${PARTITIONS_DATA}],\"gpus\":[$GPU_DATA]}"
 }
 
+# 如果直接运行此脚本，则执行 get_json_data
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    get_json_data
+fi
+DATA_EOF
+    chmod +x "$INSTALL_DIR/get_data.sh"
+}
+
+# 创建监控脚本
+create_monitor_script() {
+    echo "创建监控脚本..."
+    
+    cat > "$INSTALL_DIR/monitor.sh" << 'MONITOR_EOF'
+#!/bin/bash
+
+LOG_FILE="/var/log/system-monitor.log"
+MAX_LOG_SIZE=10485760
+
+# 日志轮转
+rotate_log() {
+    if [ -f "$LOG_FILE" ]; then
+        LOG_SIZE=$(stat -c%s "$LOG_FILE" 2>/dev/null || stat -f%z "$LOG_FILE" 2>/dev/null || echo 0)
+        if [ "$LOG_SIZE" -gt "$MAX_LOG_SIZE" ]; then
+            tail -n 500 "$LOG_FILE" > "${LOG_FILE}.tmp"
+            mv "${LOG_FILE}.tmp" "$LOG_FILE"
+        fi
+    fi
+}
+
+# 每30分钟检查依赖并轮转日志
+(
+    while true; do
+        sleep 1800
+        rotate_log
+    done
+) &
+
 generate_page() {
-    DATA=$(get_json_data)
+    DATA=$(/opt/system-monitor/get_data.sh)
     
     echo "HTTP/1.1 200 OK"
     echo "Content-Type: text/html; charset=UTF-8"
@@ -345,8 +298,8 @@ generate_page() {
         <div class="card-title" style="margin-bottom:25px">💾 磁盘信息</div>
         <div class="overview-grid">
             <div class="overview-section">
-                <div class="section-header">🔍 物理磁盘健康度</div>
-                <div id="diskHealth"></div>
+                <div class="section-header">💿 物理磁盘</div>
+                <div id="diskInfo"></div>
             </div>
             <div class="overview-section">
                 <div class="section-header">📂 磁盘分区使用情况</div>
@@ -388,23 +341,15 @@ function render(d){
     }
     var uptimeFormatted=days+'天'+hours+'时'+minutes+'分';
     document.getElementById('sys').innerHTML='<div class="row"><span class="label">操作系统</span><span class="value">'+d.sys.os+'</span></div><div class="row"><span class="label">运行时间</span><span class="value">'+uptimeFormatted+'</span></div>';
-    var healthHtml='';
+    var diskHtml='';
     if(d.disks&&d.disks.length>0){
         d.disks.forEach(function(disk){
-            var healthColor=disk.health==='PASSED'?'#10b981':'#ef4444';
-            var healthIcon=disk.health==='PASSED'?'✓':'✗';
-            var pctColor=disk.healthPct>=80?'#10b981':disk.healthPct>=60?'#f59e0b':'#ef4444';
-            var hours=parseInt(disk.hours);
-            var years=Math.floor(hours/24/365);
-            var months=Math.floor((hours-years*365*24)/24/30);
-            var days=Math.floor((hours-years*365*24-months*30*24)/24);
-            var runtimeStr=years+'年'+months+'月'+days+'天';
-            healthHtml+='<div style="margin-bottom:20px;padding-bottom:15px;border-bottom:1px solid rgba(255,255,255,.05)"><div class="row"><span class="label" style="font-weight:600;color:#4fd1c5">/dev/'+disk.disk+'</span><span class="value" style="color:'+healthColor+'">'+healthIcon+' '+disk.health+'</span></div><div class="row"><span class="label">型号</span><span class="value">'+disk.model+'</span></div><div class="row"><span class="label">健康度</span><span class="value" style="color:'+pctColor+'">'+disk.healthPct+'%</span></div><div class="row"><span class="label">运行时间</span><span class="value">'+disk.hours+' 小时 ('+runtimeStr+')</span></div><div class="row"><span class="label">温度</span><span class="value">'+(disk.temp!=='N/A'?disk.temp+'°C':disk.temp)+'</span></div></div>';
+            diskHtml+='<div class="row"><span class="label">/dev/'+disk.disk+'</span><span class="value">'+disk.size+'</span></div>';
         });
     }else{
-        healthHtml='<div class="row"><span class="value" style="color:#64748b">暂无数据</span></div>';
+        diskHtml='<div class="row"><span class="value" style="color:#64748b">暂无数据</span></div>';
     }
-    document.getElementById('diskHealth').innerHTML=healthHtml;
+    document.getElementById('diskInfo').innerHTML=diskHtml;
     var partHtml='';
     if(d.partitions&&d.partitions.length>0){
         d.partitions.forEach(function(p){
@@ -440,9 +385,190 @@ render(DATA);
 HTMLEND
 }
 
-while true; do
-    generate_page | nc -l -p $PORT -q 1 > /dev/null 2>&1
-done
+# 使用 Python HTTP 服务器（更稳定）
+python3 << 'PYSERVER'
+import http.server
+import socketserver
+import subprocess
+
+PORT = 8888
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        try:
+            # 调用独立的数据采集脚本
+            result = subprocess.run(
+                ['/opt/system-monitor/get_data.sh'],
+                capture_output=True, text=True, timeout=10
+            )
+            data = result.stdout.strip()
+            
+            # 生成 HTML
+            html = self.generate_html(data)
+            
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.send_header('Cache-Control', 'no-cache')
+            self.end_headers()
+            self.wfile.write(html.encode('utf-8'))
+        except Exception as e:
+            self.send_response(500)
+            self.end_headers()
+            self.wfile.write(f'Error: {e}'.encode())
+    
+    def generate_html(self, data):
+        return f'''<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1.0">
+    <title>系统监控中心</title>
+    <style>
+        *{{margin:0;padding:0;box-sizing:border-box}}
+        body{{font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;background:#0a0a0f;color:#e2e8f0;min-height:100vh;position:relative}}
+        .bg{{position:fixed;top:0;left:0;width:100%;height:100%;background:radial-gradient(ellipse at 20% 50%,rgba(59,130,246,.15) 0%,transparent 50%),radial-gradient(ellipse at 80% 20%,rgba(147,51,234,.15) 0%,transparent 50%),radial-gradient(ellipse at 40% 80%,rgba(6,182,212,.1) 0%,transparent 50%);z-index:-1}}
+        .grid-bg{{position:fixed;top:0;left:0;width:100%;height:100%;background-image:linear-gradient(rgba(59,130,246,.03) 1px,transparent 1px),linear-gradient(90deg,rgba(59,130,246,.03) 1px,transparent 1px);background-size:50px 50px;z-index:-1}}
+        .container{{max-width:1400px;margin:0 auto;padding:20px}}
+        header{{text-align:center;padding:30px 0;margin-bottom:30px}}
+        h1{{font-size:2.5em;font-weight:700;background:linear-gradient(135deg,#3b82f6,#8b5cf6,#06b6d4);-webkit-background-clip:text;-webkit-text-fill-color:transparent;animation:glow 3s ease-in-out infinite}}
+        @keyframes glow{{0%,100%{{filter:drop-shadow(0 0 20px rgba(59,130,246,.5))}}50%{{filter:drop-shadow(0 0 30px rgba(139,92,246,.7))}}}}
+        .subtitle{{color:#64748b;font-size:.9em;letter-spacing:3px;text-transform:uppercase}}
+        .system-overview{{margin-bottom:25px}}
+        .disk-overview{{margin-bottom:25px;max-height:400px}}
+        .disk-overview .overview-grid{{max-height:320px;overflow-y:auto}}
+        .disk-overview .overview-grid::-webkit-scrollbar{{width:8px}}
+        .disk-overview .overview-grid::-webkit-scrollbar-track{{background:rgba(255,255,255,.05);border-radius:4px}}
+        .disk-overview .overview-grid::-webkit-scrollbar-thumb{{background:rgba(59,130,246,.3);border-radius:4px}}
+        .disk-overview .overview-grid::-webkit-scrollbar-thumb:hover{{background:rgba(59,130,246,.5)}}
+        .overview-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:25px}}
+        .overview-section{{background:rgba(255,255,255,.02);border-radius:12px;padding:18px}}
+        .section-header{{display:flex;align-items:center;gap:10px;font-size:1em;font-weight:600;color:#4fd1c5;margin-bottom:15px}}
+        .section-header .card-icon{{margin-bottom:0;width:32px;height:32px;font-size:1em}}
+        .gpu-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(350px,1fr));gap:20px}}
+        .card{{background:rgba(15,23,42,.8);border:1px solid rgba(59,130,246,.2);border-radius:16px;padding:24px;backdrop-filter:blur(10px);position:relative;overflow:hidden;transition:all .3s ease}}
+        .card::before{{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,#3b82f6,#8b5cf6,#06b6d4)}}
+        .card:hover{{transform:translateY(-4px);border-color:rgba(59,130,246,.4);box-shadow:0 20px 40px rgba(59,130,246,.15)}}
+        .card-icon{{width:40px;height:40px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:1.2em;margin-bottom:15px}}
+        .card-icon.cpu{{background:linear-gradient(135deg,#3b82f6,#1d4ed8)}}
+        .card-icon.mem{{background:linear-gradient(135deg,#8b5cf6,#6d28d9)}}
+        .card-icon.disk{{background:linear-gradient(135deg,#06b6d4,#0891b2)}}
+        .card-icon.sys{{background:linear-gradient(135deg,#10b981,#059669)}}
+        .card-icon.gpu{{background:linear-gradient(135deg,#f59e0b,#d97706)}}
+        .card-title{{font-size:1.1em;font-weight:600;color:#f1f5f9;margin-bottom:20px;display:flex;align-items:center;gap:12px}}
+        .row{{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.05)}}
+        .row:last-of-type{{border-bottom:none}}
+        .label{{color:#94a3b8;font-size:.9em}}
+        .value{{color:#f1f5f9;font-weight:500}}
+        .prog-section{{margin-top:15px}}
+        .prog-header{{display:flex;justify-content:space-between;margin-bottom:8px;font-size:.85em}}
+        .prog-bar{{width:100%;height:6px;background:rgba(255,255,255,.1);border-radius:3px;overflow:hidden}}
+        .prog-fill{{height:100%;border-radius:3px;background:linear-gradient(90deg,#3b82f6,#8b5cf6);transition:width .5s ease}}
+        .prog-fill.warn{{background:linear-gradient(90deg,#f59e0b,#d97706)}}
+        .prog-fill.danger{{background:linear-gradient(90deg,#ef4444,#dc2626)}}
+        .auto-refresh{{position:fixed;top:20px;right:20px;background:rgba(59,130,246,.2);padding:8px 16px;border-radius:8px;font-size:.85em;color:#64748b}}
+        @media(max-width:768px){{.container{{padding:15px}}h1{{font-size:1.8em}}.overview-grid,.gpu-grid{{grid-template-columns:1fr;gap:15px}}.card{{padding:20px}}}}
+        @media(max-width:480px){{h1{{font-size:1.5em}}.subtitle{{font-size:.8em}}.card{{padding:16px}}}}
+    </style>
+</head>
+<body>
+<div class="bg"></div>
+<div class="grid-bg"></div>
+<div class="auto-refresh">自动刷新: <span id="countdown">5</span>s</div>
+<div class="container">
+    <header>
+        <h1>⚡ 系统监控中心</h1>
+        <div class="subtitle">System Monitor Dashboard</div>
+    </header>
+    <div class="system-overview card">
+        <div class="card-title" style="margin-bottom:25px">📊 系统概览</div>
+        <div class="overview-grid">
+            <div class="overview-section">
+                <div class="section-header"><div class="card-icon cpu">💻</div>CPU 信息</div>
+                <div id="cpu"></div>
+            </div>
+            <div class="overview-section">
+                <div class="section-header"><div class="card-icon mem">🧠</div>内存信息</div>
+                <div id="mem"></div>
+            </div>
+            <div class="overview-section">
+                <div class="section-header"><div class="card-icon sys">🖥️</div>系统信息</div>
+                <div id="sys"></div>
+            </div>
+        </div>
+    </div>
+    <div class="disk-overview card">
+        <div class="card-title" style="margin-bottom:25px">💾 磁盘信息</div>
+        <div class="overview-grid">
+            <div class="overview-section">
+                <div class="section-header">💿 物理磁盘</div>
+                <div id="diskInfo"></div>
+            </div>
+            <div class="overview-section">
+                <div class="section-header">📂 磁盘分区使用情况</div>
+                <div id="diskPartitions"></div>
+            </div>
+        </div>
+    </div>
+    <div class="gpu-grid" id="gpuGrid"></div>
+</div>
+<script>
+var DATA={data};
+function pc(v){{v=parseFloat(v);return v>80?'danger':v>60?'warn':'';}}
+var gpuCards=[];
+function render(d){{
+    document.getElementById('cpu').innerHTML='<div class="row"><span class="label">处理器</span><span class="value">'+d.cpu.model+'</span></div><div class="row"><span class="label">核心数</span><span class="value">'+d.cpu.cores+' 核</span></div><div class="prog-section"><div class="prog-header"><span class="label">使用率</span><span class="value">'+d.cpu.usage+'%</span></div><div class="prog-bar"><div class="prog-fill '+pc(d.cpu.usage)+'" style="width:'+d.cpu.usage+'%"></div></div></div>';
+    document.getElementById('mem').innerHTML='<div class="row"><span class="label">总容量</span><span class="value">'+d.mem.total+'</span></div><div class="row"><span class="label">已使用</span><span class="value">'+d.mem.used+'</span></div><div class="row"><span class="label">可用</span><span class="value">'+d.mem.free+'</span></div><div class="prog-section"><div class="prog-header"><span class="label">使用率</span><span class="value">'+d.mem.pct+'%</span></div><div class="prog-bar"><div class="prog-fill '+pc(d.mem.pct)+'" style="width:'+d.mem.pct+'%"></div></div></div>';
+    var uptimeStr=d.sys.uptime;var days=0,hours=0,minutes=0;
+    var dayMatch=uptimeStr.match(/(\\d+)\\s*day/);var hourMatch=uptimeStr.match(/(\\d+)\\s*hour/);var minMatch=uptimeStr.match(/(\\d+)\\s*minute/);
+    if(dayMatch)days=parseInt(dayMatch[1])||0;if(hourMatch)hours=parseInt(hourMatch[1])||0;if(minMatch)minutes=parseInt(minMatch[1])||0;
+    document.getElementById('sys').innerHTML='<div class="row"><span class="label">操作系统</span><span class="value">'+d.sys.os+'</span></div><div class="row"><span class="label">运行时间</span><span class="value">'+days+'天'+hours+'时'+minutes+'分</span></div>';
+    var diskHtml='';
+    if(d.disks&&d.disks.length>0){{
+        d.disks.forEach(function(disk){{
+            diskHtml+='<div class="row"><span class="label">/dev/'+disk.disk+'</span><span class="value">'+disk.size+'</span></div>';
+        }});
+    }}else{{diskHtml='<div class="row"><span class="value" style="color:#64748b">暂无数据</span></div>';}}
+    document.getElementById('diskInfo').innerHTML=diskHtml;
+    var partHtml='';
+    if(d.partitions&&d.partitions.length>0){{
+        d.partitions.forEach(function(p){{
+            partHtml+='<div style="margin-bottom:15px"><div class="row"><span class="label">'+p.mount+'</span><span class="value">'+p.dev+'</span></div><div class="row"><span class="label">容量</span><span class="value">'+p.size+' (已用 '+p.used+')</span></div><div class="prog-section"><div class="prog-header"><span class="label">使用率</span><span class="value">'+p.pct+'%</span></div><div class="prog-bar"><div class="prog-fill '+pc(p.pct)+'" style="width:'+p.pct+'%"></div></div></div></div>';
+        }});
+    }}else{{partHtml='<div class="row"><span class="value" style="color:#64748b">暂无数据</span></div>';}}
+    document.getElementById('diskPartitions').innerHTML=partHtml;
+    if(d.gpus&&d.gpus.length>0){{
+        var grid=document.getElementById('gpuGrid');
+        if(gpuCards.length===0){{
+            d.gpus.forEach(function(g,i){{
+                var card=document.createElement('div');card.className='card';card.id='gpuCard'+i;
+                card.innerHTML='<div class="card-title"><div class="card-icon gpu">🎮</div>GPU '+g.idx+': '+g.name+'</div><div id="gpuContent'+i+'"></div>';
+                grid.appendChild(card);gpuCards.push(card);
+            }});
+        }}
+        d.gpus.forEach(function(g,i){{
+            document.getElementById('gpuContent'+i).innerHTML='<div class="row"><span class="label">PCIe 地址</span><span class="value">'+g.pciBus+'</span></div><div class="row"><span class="label">当前速率</span><span class="value">PCIe '+g.pciGenCur+'.0 x'+g.pciWidthCur+'</span></div><div class="row"><span class="label">最大速率</span><span class="value">PCIe '+g.pciGenMax+'.0 x'+g.pciWidthMax+'</span></div><div class="row"><span class="label">驱动版本</span><span class="value">'+g.driver+'</span></div><div class="row"><span class="label">温度</span><span class="value">'+g.temp+'°C</span></div><div class="row"><span class="label">功耗</span><span class="value">'+g.power+' W</span></div><div class="prog-section"><div class="prog-header"><span class="label">GPU 使用率</span><span class="value">'+g.util+'%</span></div><div class="prog-bar"><div class="prog-fill '+pc(g.util)+'" style="width:'+g.util+'%"></div></div></div><div class="prog-section"><div class="prog-header"><span class="label">显存 ('+g.memUsed+'M / '+g.memTotal+'M)</span><span class="value">'+g.memPct+'%</span></div><div class="prog-bar"><div class="prog-fill '+pc(g.memPct)+'" style="width:'+g.memPct+'%"></div></div></div>';
+        }});
+    }}
+}}
+render(DATA);
+var countdown=5;
+setInterval(function(){{
+    countdown--;
+    document.getElementById('countdown').textContent=countdown;
+    if(countdown<=0){{location.reload();}}
+}},1000);
+</script>
+</body>
+</html>'''
+    
+    def log_message(self, format, *args):
+        pass
+
+socketserver.TCPServer.allow_reuse_address = True
+with socketserver.TCPServer(('', PORT), Handler) as httpd:
+    print(f'System Monitor running on port {PORT}')
+    httpd.serve_forever()
+PYSERVER
 MONITOR_EOF
 
     chmod +x "$INSTALL_DIR/monitor.sh"
@@ -484,13 +610,16 @@ main() {
     echo "停止旧服务..."
     systemctl is-active --quiet system-monitor && systemctl stop system-monitor 2>/dev/null || true
     
-    # 4. 创建监控脚本
+    # 4. 创建数据采集脚本
+    create_data_script
+    
+    # 5. 创建监控脚本
     create_monitor_script
     
-    # 5. 创建systemd服务
+    # 6. 创建systemd服务
     create_service
     
-    # 6. 启动服务
+    # 7. 启动服务
     echo "启动系统监控服务..."
     systemctl enable system-monitor
     systemctl start system-monitor
