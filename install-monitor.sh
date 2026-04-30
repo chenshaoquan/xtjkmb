@@ -417,83 +417,410 @@ HTML_PAGE = '''<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>硬件监控面板</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-:root{--bg:#0b1120;--card:#0f1729;--card-hover:#131d35;--border:#1b2a4a;--text:#e8edf5;--text-secondary:#8899bb;--text-dim:#4a5a7a;--accent:#38bdf8;--accent2:#818cf8;--green:#34d399;--yellow:#fbbf24;--red:#f87171;--glow:rgba(56,189,248,.08)}
-body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Hiragino Sans GB','Microsoft YaHei',sans-serif;font-size:13px;line-height:1.6;min-height:100vh}
-.container{max-width:1800px;margin:0 auto;padding:24px}
-.header{display:flex;justify-content:space-between;align-items:center;padding:20px 0;border-bottom:1px solid var(--border);margin-bottom:28px}
-.header h1{font-size:20px;font-weight:700;letter-spacing:3px;color:var(--accent);display:flex;align-items:center;gap:12px}
-.header h1::before{content:'';width:10px;height:10px;background:var(--green);border-radius:50%;box-shadow:0 0 12px rgba(52,211,153,.5);animation:pulse 2s infinite}
-@keyframes pulse{0%,100%{opacity:1;box-shadow:0 0 6px rgba(52,211,153,.5)}50%{opacity:.7;box-shadow:0 0 16px rgba(52,211,153,.3)}}
-.header .meta{font-size:12px;color:var(--text-secondary);text-align:right;line-height:1.8}
-.status-bar{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;padding:18px 24px;background:var(--card);border:1px solid var(--border);border-radius:10px;margin-bottom:28px;box-shadow:0 2px 20px rgba(0,0,0,.3)}
-.status-item{text-align:center;padding:8px 0}
-.status-item .label{font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:var(--text-dim);margin-bottom:6px}
-.status-item .value{font-size:13px;font-weight:600;color:var(--text)}
-.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:20px;margin-bottom:20px}
+:root{
+  --bg:#0b1120;
+  --bg-2:#080d18;
+  --card:#0f172a;
+  --card-hover:#141e33;
+  --card-2:#0a1020;
+  --border:#1b2a4a;
+  --border-2:#243552;
+  --text:#e8edf5;
+  --text-secondary:#8899bb;
+  --text-dim:#4a5a7a;
+  --accent:#38bdf8;
+  --accent-glow:rgba(56,189,248,0.15);
+  --accent2:#818cf8;
+  --green:#34d399;
+  --green-glow:rgba(52,211,153,0.12);
+  --yellow:#fbbf24;
+  --yellow-glow:rgba(251,191,36,0.12);
+  --red:#f87171;
+  --red-glow:rgba(248,113,113,0.12);
+}
+body{
+  background:var(--bg);
+  background-image:
+    radial-gradient(ellipse 80% 50% at 50% -20%, rgba(56,189,248,0.08), transparent),
+    radial-gradient(ellipse 60% 40% at 100% 100%, rgba(129,140,248,0.05), transparent);
+  color:var(--text);
+  font-family:'Outfit',-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Hiragino Sans GB','Microsoft YaHei',sans-serif;
+  font-size:13px;
+  line-height:1.6;
+  min-height:100vh;
+  -webkit-font-smoothing:antialiased;
+}
+.container{max-width:1800px;margin:0 auto;padding:28px 32px}
+.header{display:flex;justify-content:space-between;align-items:center;padding:24px 0;border-bottom:1px solid var(--border);margin-bottom:32px;position:relative}
+.header::after{content:'';position:absolute;bottom:-1px;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,var(--accent),transparent);opacity:0.3}
+.header h1{font-size:22px;font-weight:600;letter-spacing:1px;color:var(--text);display:flex;align-items:center;gap:14px}
+.header h1::before{content:'';width:8px;height:8px;background:var(--green);border-radius:50%;box-shadow:0 0 16px var(--green),0 0 32px rgba(52,211,153,0.4);animation:pulse 2.5s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:0.7;transform:scale(0.92)}}
+.header .meta{font-size:12px;color:var(--text-secondary);text-align:right;line-height:1.9;font-family:'JetBrains Mono',monospace}
+.header .meta span{opacity:0.8}
+.status-bar{
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(160px,1fr));
+  gap:14px;
+  padding:20px 24px;
+  background:var(--card);
+  border:1px solid var(--border);
+  border-radius:14px;
+  margin-bottom:28px;
+  box-shadow:
+    0 4px 24px rgba(0,0,0,0.4),
+    inset 0 1px 0 rgba(255,255,255,0.03);
+  position:relative;
+  overflow:hidden
+}
+.status-bar::before{
+  content:'';
+  position:absolute;
+  top:0;left:0;right:0;height:1px;
+  background:linear-gradient(90deg,transparent,rgba(56,189,248,0.4),transparent);
+}
+.status-item{text-align:center;padding:10px 6px;position:relative}
+.status-item:not(:last-child)::after{
+  content:'';
+  position:absolute;
+  right:0;top:20%;bottom:20%;
+  width:1px;
+  background:linear-gradient(180deg,transparent,var(--border),transparent);
+}
+.status-item .label{
+  font-size:9px;
+  text-transform:uppercase;
+  letter-spacing:2px;
+  color:var(--text-dim);
+  margin-bottom:8px;
+  font-weight:500;
+}
+.status-item .value{
+  font-size:14px;
+  font-weight:600;
+  color:var(--text);
+  font-family:'JetBrains Mono',monospace;
+}
+.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:20px;margin-bottom:24px}
 .grid-3{grid-template-columns:repeat(3,1fr)}
-.card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:20px;transition:all .25s ease;box-shadow:0 2px 12px rgba(0,0,0,.2)}
-.card:hover{background:var(--card-hover);border-color:#2a3d6a;box-shadow:0 4px 24px rgba(0,0,0,.3)}
-.card-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;padding-bottom:12px;border-bottom:1px solid var(--border)}
-.card-title{font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:2px;color:var(--text-secondary)}
-.card-badge{font-size:10px;padding:4px 12px;background:rgba(56,189,248,.08);border:1px solid rgba(56,189,248,.2);border-radius:4px;color:var(--accent);font-weight:600}
+.card{
+  background:var(--card);
+  border:1px solid var(--border);
+  border-radius:16px;
+  padding:24px;
+  transition:all 0.3s ease;
+  box-shadow:0 4px 20px rgba(0,0,0,0.3);
+  position:relative;
+  overflow:hidden;
+}
+.card::before{
+  content:'';
+  position:absolute;
+  top:0;left:0;right:0;height:2px;
+  background:linear-gradient(90deg,var(--accent),var(--accent2));
+  opacity:0;
+  transition:opacity 0.3s ease;
+}
+.card:hover{
+  background:var(--card-hover);
+  border-color:var(--border-2);
+  box-shadow:0 8px 40px rgba(0,0,0,0.4);
+  transform:translateY(-2px);
+}
+.card:hover::before{opacity:1}
+.card-header{
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  margin-bottom:20px;
+  padding-bottom:16px;
+  border-bottom:1px solid rgba(255,255,255,0.05);
+}
+.card-title{
+  font-size:11px;
+  font-weight:600;
+  text-transform:uppercase;
+  letter-spacing:2.5px;
+  color:var(--text-secondary);
+}
+.card-badge{
+  font-size:9px;
+  padding:5px 12px;
+  background:var(--accent-glow);
+  border:1px solid rgba(56,189,248,0.2);
+  border-radius:20px;
+  color:var(--accent);
+  font-weight:600;
+  letter-spacing:1px;
+}
 .full-width{grid-column:1/-1}
-.gpu-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:20px;margin-bottom:20px}
-.gpu-card{border-left:3px solid var(--accent);background:linear-gradient(135deg,var(--card) 0%,#0d1525 100%)}
-.gpu-header{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:16px}
-.gpu-name{font-size:16px;font-weight:700;color:var(--text);margin-bottom:4px}
-.gpu-bus{font-size:13px;color:var(--text);font-weight:500}
-.gpu-index{font-size:11px;font-weight:700;color:var(--accent);background:rgba(56,189,248,.1);padding:5px 14px;border-radius:5px;border:1px solid rgba(56,189,248,.2)}
-.stats-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
-.stat-box{padding:14px 10px;background:rgba(0,0,0,.3);border-radius:8px;border:1px solid rgba(255,255,255,.04);text-align:center}
-.stat-box .stat-label{font-size:9px;text-transform:uppercase;letter-spacing:1px;color:var(--text-dim);margin-bottom:6px}
-.stat-box .stat-value{font-size:20px;font-weight:700;color:var(--text)}
-.stat-box .stat-sub{font-size:10px;color:var(--text-dim);margin-top:3px}
-.pcie-section{margin-top:16px;padding-top:16px;border-top:1px solid var(--border);display:flex;gap:12px;flex-wrap:wrap}
-.pcie-tag{display:inline-flex;align-items:center;gap:10px;padding:10px 18px;background:rgba(56,189,248,.06);border:1px solid rgba(56,189,248,.18);border-radius:8px}
-.pcie-tag .pcie-label{color:var(--text-dim);font-size:10px;text-transform:uppercase;letter-spacing:1.5px;font-weight:500}
-.pcie-tag .pcie-value{color:var(--accent);font-weight:700;font-size:15px;letter-spacing:.5px}
-.progress{height:4px;background:rgba(255,255,255,.06);border-radius:3px;overflow:hidden;margin-top:8px}
-.progress-fill{height:100%;border-radius:3px;transition:width .5s ease}
-.fill-green{background:linear-gradient(90deg,#059669,var(--green))}
-.fill-yellow{background:linear-gradient(90deg,#d97706,var(--yellow))}
-.fill-red{background:linear-gradient(90deg,#dc2626,var(--red))}
-.fill-accent{background:linear-gradient(90deg,#2563eb,var(--accent))}
+.gpu-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:20px;margin-bottom:24px}
+.gpu-card{
+  border:1px solid var(--border);
+  border-radius:16px;
+  padding:24px;
+  background:linear-gradient(145deg,var(--card) 0%,var(--bg-2) 100%);
+  box-shadow:0 4px 20px rgba(0,0,0,0.35);
+  position:relative;
+  overflow:hidden;
+  transition:all 0.3s ease;
+}
+.gpu-card::before{
+  content:'';
+  position:absolute;
+  top:0;left:0;width:3px;bottom:0;
+  background:linear-gradient(180deg,var(--accent),var(--accent2));
+  border-radius:3px 0 0 3px;
+}
+.gpu-card:hover{
+  border-color:var(--border-2);
+  box-shadow:0 8px 40px rgba(0,0,0,0.45);
+  transform:translateY(-2px);
+}
+.gpu-header{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:20px}
+.gpu-name{font-size:15px;font-weight:600;color:var(--text);margin-bottom:6px;letter-spacing:0.3px}
+.gpu-bus{font-size:12px;color:var(--text-secondary);font-weight:400}
+.gpu-index{
+  font-size:10px;
+  font-weight:700;
+  color:var(--accent);
+  background:var(--accent-glow);
+  padding:6px 14px;
+  border-radius:8px;
+  border:1px solid rgba(56,189,248,0.15);
+  letter-spacing:1px;
+}
+.stats-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+.stat-box{
+  padding:16px 12px;
+  background:rgba(0,0,0,0.25);
+  border-radius:12px;
+  border:1px solid rgba(255,255,255,0.03);
+  text-align:center;
+  transition:all 0.2s ease;
+}
+.stat-box:hover{
+  background:rgba(0,0,0,0.35);
+  border-color:rgba(255,255,255,0.06);
+}
+.stat-box .stat-label{
+  font-size:8px;
+  text-transform:uppercase;
+  letter-spacing:1.5px;
+  color:var(--text-dim);
+  margin-bottom:10px;
+  font-weight:500;
+}
+.stat-box .stat-value{
+  font-size:22px;
+  font-weight:700;
+  color:var(--text);
+  font-family:'JetBrains Mono',monospace;
+  line-height:1.2;
+}
+.stat-box .stat-sub{
+  font-size:10px;
+  color:var(--text-dim);
+  margin-top:6px;
+  font-weight:400;
+}
+.pcie-section{
+  margin-top:20px;
+  padding-top:20px;
+  border-top:1px solid rgba(255,255,255,0.05);
+  display:flex;
+  gap:12px;
+  flex-wrap:wrap;
+}
+.pcie-tag{
+  display:inline-flex;
+  align-items:center;
+  gap:12px;
+  padding:12px 18px;
+  background:rgba(0,0,0,0.2);
+  border:1px solid rgba(56,189,248,0.1);
+  border-radius:10px;
+  flex:1;
+  min-width:140px;
+  transition:all 0.2s ease;
+}
+.pcie-tag:hover{
+  background:rgba(56,189,248,0.05);
+  border-color:rgba(56,189,248,0.2);
+}
+.pcie-tag .pcie-label{
+  color:var(--text-dim);
+  font-size:9px;
+  text-transform:uppercase;
+  letter-spacing:1.5px;
+  font-weight:500;
+}
+.pcie-tag .pcie-value{
+  color:var(--accent);
+  font-weight:700;
+  font-size:14px;
+  letter-spacing:0.5px;
+  font-family:'JetBrains Mono',monospace;
+}
+.progress{
+  height:5px;
+  background:rgba(0,0,0,0.4);
+  border-radius:4px;
+  overflow:hidden;
+  margin-top:10px;
+  box-shadow:inset 0 1px 3px rgba(0,0,0,0.3);
+}
+.progress-fill{
+  height:100%;
+  border-radius:4px;
+  transition:width 0.6s cubic-bezier(0.4,0,0.2,1);
+  position:relative;
+}
+.progress-fill::after{
+  content:'';
+  position:absolute;
+  top:0;left:0;right:0;height:50%;
+  background:linear-gradient(180deg,rgba(255,255,255,0.2),transparent);
+  border-radius:4px 4px 0 0;
+}
+.fill-green{background:linear-gradient(90deg,#059669,var(--green),#10b981)}
+.fill-yellow{background:linear-gradient(90deg,#d97706,var(--yellow),#f59e0b)}
+.fill-red{background:linear-gradient(90deg,#dc2626,var(--red),#ef4444)}
+.fill-accent{background:linear-gradient(90deg,#2563eb,var(--accent),#0ea5e9)}
 table{width:100%;border-collapse:collapse}
-th{text-align:left;padding:12px 14px;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:1.5px;color:var(--text-dim);border-bottom:1px solid var(--border)}
-td{padding:12px 14px;font-size:13px;color:var(--text);border-bottom:1px solid rgba(255,255,255,.04)}
-tr:hover td{background:rgba(56,189,248,.03)}
-.tag{display:inline-block;padding:4px 10px;border-radius:5px;font-size:11px;font-weight:600}
-.tag-green{background:rgba(52,211,153,.12);color:var(--green)}
-.tag-yellow{background:rgba(251,191,36,.12);color:var(--yellow)}
-.tag-red{background:rgba(248,113,113,.12);color:var(--red)}
-.no-gpu{text-align:center;padding:40px;color:var(--text-dim);font-size:14px}
-.burn-btn{padding:6px 16px;border-radius:6px;border:1px solid rgba(248,113,113,.5);background:rgba(248,113,113,.15);color:var(--red);font-size:11px;font-weight:600;cursor:pointer;transition:all .2s;letter-spacing:1px}
-.burn-btn:hover{background:rgba(248,113,113,.3);border-color:rgba(248,113,113,.7)}
-.burn-btn.burning{background:rgba(248,113,113,.35);border-color:rgba(248,113,113,.6);color:#fff;animation:burnPulse 1.5s infinite}
-.burn-btn.burning:hover{background:rgba(248,113,113,.45)}
-@keyframes burnPulse{0%,100%{opacity:1}50%{opacity:.7}}
-.footer{text-align:center;padding:20px 0;color:var(--text-dim);font-size:10px;letter-spacing:2px;border-top:1px solid var(--border);margin-top:28px}
+th{
+  text-align:left;
+  padding:14px 16px;
+  font-size:9px;
+  font-weight:600;
+  text-transform:uppercase;
+  letter-spacing:2px;
+  color:var(--text-dim);
+  border-bottom:1px solid var(--border);
+  background:rgba(0,0,0,0.2);
+}
+td{
+  padding:14px 16px;
+  font-size:13px;
+  color:var(--text);
+  border-bottom:1px solid rgba(255,255,255,0.03);
+  font-family:'JetBrains Mono',monospace;
+  font-size:12px;
+}
+tr{transition:all 0.15s ease}
+tr:hover td{
+  background:rgba(56,189,248,0.04);
+}
+tr:last-child td{border-bottom:none}
+.tag{
+  display:inline-block;
+  padding:5px 12px;
+  border-radius:6px;
+  font-size:10px;
+  font-weight:600;
+  letter-spacing:0.5px;
+}
+.tag-green{background:var(--green-glow);color:var(--green);border:1px solid rgba(52,211,153,0.2)}
+.tag-yellow{background:var(--yellow-glow);color:var(--yellow);border:1px solid rgba(251,191,36,0.2)}
+.tag-red{background:var(--red-glow);color:var(--red);border:1px solid rgba(248,113,113,0.2)}
+.no-gpu{
+  text-align:center;
+  padding:60px 40px;
+  color:var(--text-dim);
+  font-size:14px;
+  position:relative;
+}
+.no-gpu::before{
+  content:'';
+  display:block;
+  width:60px;
+  height:60px;
+  margin:0 auto 20px;
+  border-radius:50%;
+  background:rgba(248,113,113,0.1);
+  border:1px dashed rgba(248,113,113,0.3);
+}
+.burn-btn{
+  padding:8px 18px;
+  border-radius:8px;
+  border:1px solid rgba(248,113,113,0.4);
+  background:rgba(248,113,113,0.1);
+  color:var(--red);
+  font-size:10px;
+  font-weight:600;
+  cursor:pointer;
+  transition:all 0.25s ease;
+  letter-spacing:1px;
+  font-family:'Outfit',sans-serif;
+}
+.burn-btn:hover{
+  background:rgba(248,113,113,0.2);
+  border-color:rgba(248,113,113,0.6);
+  box-shadow:0 0 20px rgba(248,113,113,0.2);
+}
+.burn-btn.burning{
+  background:rgba(248,113,113,0.25);
+  border-color:rgba(248,113,113,0.5);
+  color:#fff;
+  animation:burnPulse 1.8s ease-in-out infinite;
+}
+.burn-btn.burning:hover{
+  background:rgba(248,113,113,0.35);
+  animation:none;
+}
+@keyframes burnPulse{0%,100%{opacity:1;box-shadow:0 0 10px rgba(248,113,113,0.3)}50%{opacity:0.75;box-shadow:0 0 25px rgba(248,113,113,0.5)}}
+.footer{
+  text-align:center;
+  padding:28px 0;
+  color:var(--text-dim);
+  font-size:9px;
+  letter-spacing:3px;
+  border-top:1px solid var(--border);
+  margin-top:32px;
+  text-transform:uppercase;
+}
 .temp-green{color:var(--green)}
 .temp-yellow{color:var(--yellow)}
 .temp-red{color:var(--red)}
 @media(max-width:1400px){.gpu-grid{grid-template-columns:1fr}}
 @media(max-width:1200px){.grid{grid-template-columns:1fr}.grid-3{grid-template-columns:1fr}}
-@media(max-width:768px){.stats-grid{grid-template-columns:repeat(2,1fr)}.status-bar{grid-template-columns:repeat(2,1fr)}.container{padding:12px}.header{flex-direction:column;gap:12px;text-align:center}.header .meta{text-align:center}.header h1{font-size:16px}.gpu-header{flex-direction:column;gap:10px}.gpu-name{font-size:14px}.pcie-section{flex-direction:column}.pcie-tag{width:100%;justify-content:space-between}.card{padding:14px}.stat-box .stat-value{font-size:16px}}
-@media(max-width:480px){.stats-grid{grid-template-columns:1fr}.status-bar{grid-template-columns:1fr}.burn-btn{width:100%;padding:10px}}
+@media(max-width:768px){
+  .stats-grid{grid-template-columns:repeat(2,1fr)}
+  .status-bar{grid-template-columns:repeat(2,1fr)}
+  .container{padding:16px}
+  .header{flex-direction:column;gap:16px;text-align:center}
+  .header .meta{text-align:center}
+  .header h1{font-size:18px}
+  .gpu-header{flex-direction:column;gap:12px}
+  .gpu-name{font-size:14px}
+  .pcie-section{flex-direction:column}
+  .pcie-tag{width:100%;justify-content:space-between}
+  .card{padding:18px;border-radius:12px}
+  .stat-box .stat-value{font-size:18px}
+}
+@media(max-width:480px){
+  .stats-grid{grid-template-columns:1fr}
+  .status-bar{grid-template-columns:1fr}
+  .burn-btn{width:100%;padding:12px}
+}
 </style>
 </head>
 <body>
 <div class="container">
   <div class="header">
     <h1 id="pageTitle">硬件监控面板</h1>
-    <div class="meta"><span id="hostname">-</span><br><span id="timestamp">-</span></div>
+    <div class="meta"><span id="hostname">-</span>&nbsp;&nbsp;<span id="timestamp">-</span></div>
   </div>
   <div class="status-bar" id="statusBar"></div>
   <div class="grid grid-3" id="systemSection"></div>
   <div class="gpu-grid" id="gpuSection"></div>
   <div class="grid" id="storageSection"></div>
+  <div class="footer">Hardware Monitor · Enterprise Edition</div>
 </div>
 <script>
 function pctClass(v){return v>90?'red':v>70?'yellow':'green'}
@@ -513,7 +840,7 @@ function renderStatus(d){
     '<div class="status-item"><div class="label">运行时间</div><div class="value">'+d.uptime+'</div></div>';
   if(d.has_gpu){
     var totalPower=0;d.gpus.forEach(function(g){totalPower+=g.power});
-    html+='<div class="status-item"><div class="label">CUDA版本</div><div class="value">'+d.driver.cuda+'</div></div>';
+    html+='<div class="status-item"><div class="label">CUDA</div><div class="value">'+d.driver.cuda+'</div></div>';
     html+='<div class="status-item"><div class="label">GPU总功耗</div><div class="value">'+totalPower.toFixed(1)+' W</div></div>';
   }
   document.getElementById('statusBar').innerHTML=html;
@@ -523,18 +850,17 @@ function renderSystem(d){
   var cpu=d.cpu,mem=d.memory,mf=d.memory_fmt;
   document.getElementById('systemSection').innerHTML=
     '<div class="card"><div class="card-header"><span class="card-title">处理器</span><span class="card-badge">CPU</span></div>'+
-    '<div style="font-size:14px;font-weight:600;color:var(--text);margin-bottom:16px">'+cpu.model+'</div>'+
     '<div class="stats-grid" style="grid-template-columns:repeat(2,1fr)">'+
-    '<div class="stat-box"><div class="stat-label">核心/线程</div><div class="stat-value">'+cpu.cores+'/'+cpu.threads+'</div></div>'+
-    '<div class="stat-box"><div class="stat-label">频率</div><div class="stat-value" style="font-size:14px">'+cpu.freq+'</div></div>'+
+    '<div class="stat-box"><div class="stat-label">核心 / 线程</div><div class="stat-value">'+cpu.cores+' / '+cpu.threads+'</div></div>'+
+    '<div class="stat-box"><div class="stat-label">频率</div><div class="stat-value">'+cpu.freq+'</div></div>'+
     '</div></div>'+
     '<div class="card"><div class="card-header"><span class="card-title">内存</span><span class="card-badge">RAM</span></div>'+
     '<div class="stats-grid" style="grid-template-columns:repeat(2,1fr)">'+
-    '<div class="stat-box"><div class="stat-label">已用/总量</div><div class="stat-value" style="font-size:14px">'+mf.used+'</div><div class="stat-sub">共 '+mf.total+'</div>'+progress(mem.percent)+'</div>'+
-    '<div class="stat-box"><div class="stat-label">可用</div><div class="stat-value" style="font-size:14px">'+mf.available+'</div><div class="stat-sub">使用率 '+mem.percent+'%</div></div>'+
+    '<div class="stat-box"><div class="stat-label">已用 / 总计</div><div class="stat-value" style="font-size:16px">'+mf.used+'</div><div class="stat-sub">'+mf.total+'</div>'+progress(mem.percent)+'</div>'+
+    '<div class="stat-box"><div class="stat-label">可用</div><div class="stat-value" style="font-size:16px">'+mf.available+'</div><div class="stat-sub">'+mem.percent+'% 已用</div></div>'+
     '</div></div>'+
     '<div class="card"><div class="card-header"><span class="card-title">物理网卡</span><span class="card-badge">NET</span></div>'+
-    '<table><thead><tr><th>接口</th><th>IP地址</th><th>速率</th><th>接收</th><th>发送</th></tr></thead><tbody>'+
+    '<table><thead><tr><th>接口</th><th>IP 地址</th><th>速率</th><th>接收</th><th>发送</th></tr></thead><tbody>'+
     d.network.map(function(n){return '<tr><td>'+n.name+'</td><td>'+n.ip+'</td><td>'+n.speed+'</td><td>'+n.rx+'</td><td>'+n.tx+'</td></tr>'}).join('')+
     '</tbody></table></div>';
 }
@@ -548,15 +874,15 @@ function renderGPUs(d){
     var p=g.pcie;
     var bs=d.burn_status[String(g.index)];
     var isBurning=bs&&bs.running;
-    var burnLabel=isBurning?'\u26a0 压测中 (剩余'+Math.floor(bs.remaining/60)+'分'+bs.remaining%60+'秒) 点击停止':'压测';
+    var burnLabel=isBurning?'\u26a0 压测中 ('+Math.floor(bs.remaining/60)+'分'+bs.remaining%60+'秒)':'压测';
     var burnClass=isBurning?'burn-btn burning':'burn-btn';
-    return '<div class="card gpu-card">'+
-      '<div class="gpu-header"><div><div class="gpu-name">'+g.name+'</div><div class="gpu-bus">总线: '+g.bus_id+'</div></div><div style="display:flex;gap:8px;align-items:center"><button class="'+burnClass+'" onclick="toggleBurn('+g.index+','+!!isBurning+')">'+burnLabel+'</button><div class="gpu-index">GPU '+g.index+'</div></div></div>'+
+    return '<div class="gpu-card">'+
+      '<div class="gpu-header"><div><div class="gpu-name">'+g.name+'</div><div class="gpu-bus">Bus: '+g.bus_id+'</div></div><div style="display:flex;gap:10px;align-items:center"><button class="'+burnClass+'" onclick="toggleBurn('+g.index+','+!!isBurning+')">'+burnLabel+'</button><div class="gpu-index">GPU '+g.index+'</div></div></div>'+
       '<div class="stats-grid">'+
       '<div class="stat-box"><div class="stat-label">温度</div><div class="stat-value '+tempClass(g.temp)+'">'+g.temp+'\u00b0C</div></div>'+
       '<div class="stat-box"><div class="stat-label">利用率</div><div class="stat-value">'+g.util+'%</div>'+progress(g.util)+'</div>'+
-      '<div class="stat-box"><div class="stat-label">显存</div><div class="stat-value" style="font-size:14px">'+g.mem_used+'</div><div class="stat-sub">/ '+g.mem_total+' MiB</div>'+progress(memPct)+'</div>'+
-      '<div class="stat-box"><div class="stat-label">功耗</div><div class="stat-value" style="font-size:14px">'+g.power+'W</div><div class="stat-sub">上限 '+g.power_limit+'W</div>'+progress(pwrPct)+'</div>'+
+      '<div class="stat-box"><div class="stat-label">显存</div><div class="stat-value" style="font-size:18px">'+g.mem_used+'</div><div class="stat-sub">/ '+g.mem_total+' MiB</div>'+progress(memPct)+'</div>'+
+      '<div class="stat-box"><div class="stat-label">功耗</div><div class="stat-value" style="font-size:18px">'+g.power+'W</div><div class="stat-sub">上限 '+g.power_limit+'W</div>'+progress(pwrPct)+'</div>'+
       '</div>'+
       '<div class="pcie-section">'+
       '<div class="pcie-tag"><span class="pcie-label">PCIe 支持</span><span class="pcie-value">'+p.cap_gen_display+'</span></div>'+
@@ -568,8 +894,8 @@ function renderGPUs(d){
 
 function renderStorage(d){
   document.getElementById('storageSection').innerHTML=
-    '<div class="card full-width"><div class="card-header"><span class="card-title">存储设备</span><span class="card-badge">'+d.disks.length+' 个分区</span></div>'+
-    '<table><thead><tr><th>设备</th><th>挂载点</th><th>已用</th><th>总量</th><th>使用率</th><th style="width:150px"></th></tr></thead><tbody>'+
+    '<div class="card full-width"><div class="card-header"><span class="card-title">存储设备</span><span class="card-badge">'+d.disks.length+' 分区</span></div>'+
+    '<table><thead><tr><th>设备</th><th>挂载点</th><th>已用</th><th>总量</th><th>使用率</th><th style="width:140px"></th></tr></thead><tbody>'+
     d.disks.map(function(dk){return '<tr><td>'+dk.device+'</td><td>'+dk.mount+'</td><td>'+dk.used+'</td><td>'+dk.total+'</td><td>'+pctTag(dk.percent)+'</td><td>'+progress(dk.percent)+'</td></tr>'}).join('')+
     '</tbody></table></div>';
 }
@@ -748,15 +1074,17 @@ collect_info() {
   UPTIME_D=$((UPTIME_SEC / 86400))
   UPTIME_H=$(( (UPTIME_SEC % 86400) / 3600 ))
   UPTIME_M=$(( (UPTIME_SEC % 3600) / 60 ))
-  UPTIME_STR="${UPTIME_D}d ${UPTIME_H}h ${UPTIME_M}m"
+  UPTIME_S=$((UPTIME_SEC % 60 ))
+  UPTIME_STR="${UPTIME_D}d ${UPTIME_H}h ${UPTIME_M}m ${UPTIME_S}s"
 }
 
 show_info() {
   clear
   echo ""
-  echo "  Hostname: ${HOSTNAME}    Uptime: ${UPTIME_STR}"
+  MACHINE_ID=$(awk 'NR==1{print $NF}' /opt/frp/machine_id.txt 2>/dev/null || echo "")
+  echo "  Hostname: ${HOSTNAME}  ServerID: ${MACHINE_ID}  Uptime: ${UPTIME_STR}"
   echo ""
-  echo "  CPU:    ${CPU_MODEL} (${CPU_CORES} cores)"
+  echo "  CPU:    ${CPU_CORES} cores"
   echo "  RAM:    ${MEM_GB} GB"
   echo "  DISK:"
   echo "$(printf "    %-20s %s" "DEVICE" "SIZE")"
@@ -773,10 +1101,7 @@ show_info() {
     echo "$(printf "    %-4s %-25s %-10s %-10s %-14s %-10s %-8s" "ID" "MODEL" "BUS" "SLOT" "CURRENT" "POWER" "TEMP")"
     echo -e "$GPU_LINES"
   fi
-  echo "  --------------------------------------------"
-  echo "  WEB DASHBOARD"
-  echo "  --------------------------------------------"
-  [ -n "$LAN_IP" ] && echo "    http://${LAN_IP}:8889"
+  [ -n "$LAN_IP" ] && echo "  WEB DASHBOARD: http://${LAN_IP}:8889"
   echo ""
   echo "  >>> Press ENTER for options <<<"
   echo ""
