@@ -814,8 +814,8 @@ body{
 .node-dot.stale{background:var(--yellow);box-shadow:0 0 10px rgba(251,191,36,0.5)}
 .node-name{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .node-current{margin-left:auto;color:var(--accent);font-size:8px;letter-spacing:1px}
-.node-ip{margin-top:7px;color:var(--text-secondary);font:10px 'JetBrains Mono',monospace}
-.node-detail{margin-top:4px;color:var(--text-dim);font:9px 'JetBrains Mono',monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.node-ip{margin-top:7px;color:#fff;font:10px 'JetBrains Mono',monospace}
+.node-detail{margin-top:4px;color:#fff;font:9px 'JetBrains Mono',monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .node-empty{padding:18px 10px;color:var(--text-dim);font-size:11px;text-align:center}
 .overview-nav{display:flex;align-items:center;gap:10px;width:100%;padding:11px 12px;color:var(--text-secondary);font:inherit;text-align:left;background:rgba(15,23,42,.72);border:1px solid transparent;border-radius:11px;cursor:pointer;transition:background .2s ease,border-color .2s ease,transform .2s ease}
 .overview-nav:hover{color:var(--text);background:var(--card-hover);border-color:var(--border-2);transform:translateX(2px)}
@@ -848,6 +848,12 @@ body{
 .fleet-model-row,.fleet-device-row{display:grid;height:28px;min-height:28px;grid-template-columns:minmax(0,1fr) auto;gap:7px;align-items:center}
 .fleet-row-name{min-width:0;color:var(--text);font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .fleet-row-value{color:var(--accent);font:700 10px 'JetBrains Mono',monospace}
+.fleet-device-row{grid-template-columns:minmax(0,1fr) 72px}
+.fleet-device-row .fleet-row-value{text-align:right}
+.fleet-device-label{display:grid;min-width:0;grid-template-columns:minmax(0,1fr) 84px;align-items:center;gap:18px}
+.fleet-device-model{min-width:0;overflow:hidden;color:var(--text);font-size:10px;white-space:nowrap;text-overflow:ellipsis}
+.fleet-device-host{display:flex;min-width:0;align-items:center;gap:6px;overflow:hidden;color:var(--text-secondary);font:9px 'JetBrains Mono',monospace;white-space:nowrap;text-overflow:ellipsis}
+.fleet-device-host .node-dot{width:6px;height:6px}
 .fleet-bar{grid-column:1/-1;height:5px;overflow:hidden;background:rgba(2,6,23,.82);border-radius:999px}
 .fleet-bar-fill{height:100%;background:linear-gradient(90deg,var(--accent),var(--green));border-radius:inherit;box-shadow:0 0 10px rgba(56,189,248,.22)}
 .fleet-empty{padding:28px;color:var(--text-dim);font-size:11px;text-align:center}
@@ -1375,6 +1381,8 @@ tr:last-child td{border-bottom:none}
   .fleet-panels{grid-template-columns:1fr;gap:9px;margin-bottom:14px}
   .fleet-panel{padding:13px;border-radius:11px}
   .fleet-panel-head{margin-bottom:11px;padding-bottom:8px}
+  .fleet-device-row{grid-template-columns:minmax(0,1fr) 64px}
+  .fleet-device-label{grid-template-columns:minmax(0,1fr) 68px;gap:10px}
   .footer{margin-top:14px;padding:16px 0}
 }
 
@@ -1479,9 +1487,26 @@ function powerMarkup(watts){
   var parts=formatPower(watts).split(' ');
   return esc(parts[0])+'<small>'+esc(parts[1]||'W')+'</small>';
 }
+function gpuModelSummary(node){
+  var gpus=Array.isArray(node&&node.gpu_summary)?node.gpu_summary:[];
+  var declared=Math.max(Number(node&&node.gpu_count||0),gpus.length);
+  var counts={};
+  gpus.forEach(function(gpu){
+    var name=String(gpu&&gpu.name||'Unknown GPU');
+    counts[name]=(counts[name]||0)+1;
+  });
+  var parts=Object.keys(counts).sort(function(a,b){return counts[b]-counts[a]||a.localeCompare(b)}).map(function(name){return name+' ×'+counts[name]});
+  var missing=Math.max(0,declared-gpus.length);
+  if(missing)parts.push('数据待同步 ×'+missing);
+  return parts.length?parts.join(' + '):'未检测到 GPU';
+}
 function renderOverview(d){
   var nodes=Array.isArray(d.nodes)?d.nodes:[];
   var dashboard=document.getElementById('fleetDashboard');
+  var oldModelList=dashboard.querySelector('.fleet-model-list');
+  var oldDeviceList=dashboard.querySelector('.fleet-device-list');
+  var modelScrollTop=oldModelList?oldModelList.scrollTop:0;
+  var deviceScrollTop=oldDeviceList?oldDeviceList.scrollTop:0;
   if(nodes.length<2){
     dashboard.innerHTML='';
     if(mainView==='overview')setMainView('node');
@@ -1503,7 +1528,7 @@ function renderOverview(d){
     totalPower+=machinePower;
     var missing=Math.max(0,count-gpus.length);
     if(missing){modelCounts['数据待同步']=(modelCounts['数据待同步']||0)+missing}
-    machines.push({node:node,count:count,power:machinePower});
+    machines.push({node:node,count:count,power:machinePower,gpuLabel:gpuModelSummary(node)});
   });
 
   var models=Object.keys(modelCounts).sort(function(a,b){return modelCounts[b]-modelCounts[a]});
@@ -1514,7 +1539,7 @@ function renderOverview(d){
   var maxMachinePower=Math.max.apply(null,machines.map(function(machine){return machine.power}).concat([1]));
   var deviceHtml=machines.map(function(machine){
     var percent=machine.power/maxMachinePower*100;
-    return '<div class="fleet-device-row"><span class="fleet-row-name"><span class="node-dot"></span>&nbsp;'+esc(machine.node.hostname)+'</span><span class="fleet-row-value">'+formatPower(machine.power)+'</span><div class="fleet-bar"><div class="fleet-bar-fill" style="width:'+percent.toFixed(1)+'%"></div></div></div>';
+    return '<div class="fleet-device-row"><span class="fleet-device-label"><span class="fleet-device-model" title="'+esc(machine.gpuLabel)+'">'+esc(machine.gpuLabel)+'</span><span class="fleet-device-host" title="'+esc(machine.node.hostname)+'"><span class="node-dot"></span>'+esc(machine.node.hostname)+'</span></span><span class="fleet-row-value">'+formatPower(machine.power)+'</span><div class="fleet-bar"><div class="fleet-bar-fill" style="width:'+percent.toFixed(1)+'%"></div></div></div>';
   }).join('');
   var averagePower=totalGpus?totalPower/totalGpus:0;
   dashboard.innerHTML='<div class="header fleet-header"><h1>局域网数据概览</h1><div class="meta"><span>'+nodes.length+' 台设备在线</span>&nbsp;&nbsp;<span>'+esc(d.timestamp)+'</span></div></div>'+
@@ -1526,6 +1551,10 @@ function renderOverview(d){
     '</div>'+
     '<div class="fleet-panels"><section class="fleet-panel"><div class="fleet-panel-head"><span class="fleet-panel-title">显卡型号分布</span><span class="fleet-panel-meta">'+totalGpus+' 张</span></div><div class="fleet-model-list">'+(modelHtml||'<div class="fleet-empty">暂无显卡数据</div>')+'</div></section>'+
       '<section class="fleet-panel"><div class="fleet-panel-head"><span class="fleet-panel-title">设备功耗对比</span><span class="fleet-panel-meta">实时</span></div><div class="fleet-device-list">'+deviceHtml+'</div></section></div>';
+  var newModelList=dashboard.querySelector('.fleet-model-list');
+  var newDeviceList=dashboard.querySelector('.fleet-device-list');
+  if(newModelList)newModelList.scrollTop=Math.min(modelScrollTop,Math.max(0,newModelList.scrollHeight-newModelList.clientHeight));
+  if(newDeviceList)newDeviceList.scrollTop=Math.min(deviceScrollTop,Math.max(0,newDeviceList.scrollHeight-newDeviceList.clientHeight));
 }
 function renderNodes(d){
   var nodes=Array.isArray(d.nodes)?d.nodes:[];
@@ -1539,7 +1568,7 @@ function renderNodes(d){
     var targetIp=node.current?location.hostname:pickNodeIp(node);
     var displayIp=node.source_ip||((Array.isArray(node.addresses)&&node.addresses.length)?node.addresses[0]:targetIp);
     var stale=!node.current&&Number(node.age||0)>10;
-    var detail='GPU '+Number(node.gpu_count||0)+' · '+String(node.primary_mac||'-');
+    var detail=gpuModelSummary(node);
     var inner='<div class="node-title-row"><span class="node-dot'+(stale?' stale':'')+'"></span>'+
       '<span class="node-name">'+esc(node.hostname)+'</span>'+
       (node.current?'<span class="node-current">当前</span>':'')+'</div>'+
