@@ -49,13 +49,29 @@ import time
 import socket
 import threading
 import signal
-from datetime import datetime
+import uuid
+import ipaddress
+import sys
+from datetime import datetime, timedelta, timezone
 
 PORT = 8889
+DISCOVERY_PORT = 8890
+DISCOVERY_INTERVAL = 5
+PEER_TIMEOUT = 20
+DISCOVERY_PROTOCOL = "hw-monitor-discovery"
+DISCOVERY_VERSION = 1
+NODE_ID_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "node-id")
+BEIJING_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 
 # Track burn test processes: {gpu_index: {"proc": Popen, "start": timestamp}}
 burn_processes = {}
 burn_lock = threading.Lock()
+
+# LAN discovery state: {node_id: node_info}
+discovered_nodes = {}
+discovery_lock = threading.Lock()
+node_id_lock = threading.Lock()
+local_node_id = None
 
 def run_cmd(cmd, timeout=5):
     try:
@@ -289,6 +305,310 @@ def get_network_info():
 def get_hostname():
     return socket.gethostname()
 
+def get_node_id():
+    """Return a stable UUID for this monitor installation."""
+    global local_node_id
+    with node_id_lock:
+        if local_node_id:
+            return local_node_id
+        try:
+            value = open(NODE_ID_FILE, 'r', encoding='utf-8').read().strip()
+            local_node_id = str(uuid.UUID(value))
+            return local_node_id
+        except:
+            pass
+
+        value = str(uuid.uuid4())
+        try:
+            with open(NODE_ID_FILE, 'w', encoding='utf-8') as f:
+                f.write(value + '\n')
+            os.chmod(NODE_ID_FILE, 0o600)
+        except:
+            pass
+        local_node_id = value
+        return local_node_id
+
+def is_usable_ipv4(value):
+    try:
+        addr = ipaddress.ip_address(str(value))
+        return (addr.version == 4 and not addr.is_loopback and
+                not addr.is_link_local and not addr.is_multicast and
+                not addr.is_unspecified)
+    except:
+        return False
+
+def is_container_interface(name):
+    return name.startswith(('docker', 'veth', 'br-', 'virbr', 'cni', 'flannel'))
+
+def get_discovery_network():
+    """Return access addresses, physical-LAN broadcast targets and MACs."""
+    addresses = []
+    broadcasts = []
+    macs = []
+    seen_addresses = set()
+    seen_broadcasts = set()
+    seen_macs = set()
+
+    try:
+        result = subprocess.run(
+            ['ip', '-j', '-4', 'addr', 'show'], capture_output=True,
+            text=True, timeout=5
+        )
+        ip_data = json.loads(result.stdout) if result.returncode == 0 else []
+        for item in ip_data:
+            iface = str(item.get('ifname', ''))[:64]
+            device_dir = os.path.join('/sys/class/net', iface, 'device')
+            is_physical = os.path.isdir(device_dir)
+            is_tailscale = iface.startswith('tailscale')
+            if (not iface or iface == 'lo' or is_container_interface(iface) or
+                    (not is_physical and not is_tailscale)):
+                continue
+            for addr_info in item.get('addr_info', []):
+                if addr_info.get('family') != 'inet':
+                    continue
+                local_ip = str(addr_info.get('local', ''))
+                if is_usable_ipv4(local_ip) and local_ip not in seen_addresses:
+                    addresses.append({
+                        "interface": iface,
+                        "ip": local_ip,
+                        "physical": is_physical,
+                    })
+                    seen_addresses.add(local_ip)
+                broadcast = str(addr_info.get('broadcast', ''))
+                if (is_physical and is_usable_ipv4(broadcast) and
+                        broadcast not in seen_broadcasts):
+                    broadcasts.append(broadcast)
+                    seen_broadcasts.add(broadcast)
+    except:
+        pass
+
+    try:
+        for iface in sorted(os.listdir('/sys/class/net')):
+            device_dir = os.path.join('/sys/class/net', iface, 'device')
+            address_file = os.path.join('/sys/class/net', iface, 'address')
+            if not os.path.isdir(device_dir) or not os.path.isfile(address_file):
+                continue
+            mac = open(address_file, 'r', encoding='utf-8').read().strip().upper()
+            if (re.fullmatch(r'(?:[0-9A-F]{2}:){5}[0-9A-F]{2}', mac) and
+                    mac != '00:00:00:00:00:00' and mac not in seen_macs):
+                macs.append({"interface": iface[:64], "mac": mac})
+                seen_macs.add(mac)
+    except:
+        pass
+
+    return addresses, broadcasts, macs
+
+def get_gpu_count_quick():
+    out = run_cmd('nvidia-smi --query-gpu=index --format=csv,noheader,nounits', timeout=8)
+    return len([line for line in out.splitlines() if line.strip()]) if out else 0
+
+def get_gpu_power_summary_quick():
+    """Return compact GPU model/power data for LAN overview broadcasts."""
+    summary = []
+    out = run_cmd(
+        'nvidia-smi --query-gpu=index,name,power.draw --format=csv,noheader,nounits',
+        timeout=8
+    )
+    if not out:
+        return summary
+    for line in out.splitlines()[:64]:
+        try:
+            parts = [part.strip() for part in line.split(',', 2)]
+            if len(parts) != 3:
+                continue
+            summary.append({
+                "index": max(0, min(127, int(parts[0]))),
+                "name": parts[1][:96],
+                "power": round(max(0.0, min(5000.0, float(parts[2]))), 2),
+            })
+        except:
+            continue
+    return summary
+
+def build_discovery_announcement():
+    addresses, broadcasts, macs = get_discovery_network()
+    gpu_summary = get_gpu_power_summary_quick()
+    payload = {
+        "protocol": DISCOVERY_PROTOCOL,
+        "version": DISCOVERY_VERSION,
+        "node_id": get_node_id(),
+        "hostname": get_hostname()[:64],
+        "port": PORT,
+        "addresses": [item["ip"] for item in addresses],
+        "macs": macs,
+        "gpu_count": len(gpu_summary),
+        "gpu_summary": gpu_summary,
+        "timestamp": int(time.time()),
+    }
+    return json.dumps(payload, ensure_ascii=False, separators=(',', ':')).encode('utf-8'), broadcasts
+
+def sanitize_discovery_packet(payload, source_ip):
+    if payload.get('protocol') != DISCOVERY_PROTOCOL or payload.get('version') != DISCOVERY_VERSION:
+        return None
+    try:
+        node_id = str(uuid.UUID(str(payload.get('node_id', ''))))
+    except:
+        return None
+    if node_id == get_node_id() or not is_usable_ipv4(source_ip):
+        return None
+
+    raw_hostname = str(payload.get('hostname', 'unknown'))[:64]
+    blocked = {"<", ">", "&", '"', "'"}
+    hostname = ''.join(ch for ch in raw_hostname if ch.isprintable() and ch not in blocked).strip()
+    hostname = hostname or 'unknown'
+
+    try:
+        port = int(payload.get('port', PORT))
+        if port < 1 or port > 65535:
+            raise ValueError()
+    except:
+        port = PORT
+
+    addresses = [source_ip]
+    for value in payload.get('addresses', [])[:16]:
+        value = str(value)
+        if is_usable_ipv4(value) and value not in addresses:
+            addresses.append(value)
+
+    macs = []
+    for item in payload.get('macs', [])[:16]:
+        if not isinstance(item, dict):
+            continue
+        mac = str(item.get('mac', '')).upper()
+        iface = str(item.get('interface', ''))[:64]
+        if re.fullmatch(r'(?:[0-9A-F]{2}:){5}[0-9A-F]{2}', mac):
+            macs.append({"interface": iface, "mac": mac})
+
+    try:
+        gpu_count = max(0, min(128, int(payload.get('gpu_count', 0))))
+    except:
+        gpu_count = 0
+
+    gpu_summary = []
+    for item in payload.get('gpu_summary', [])[:64]:
+        if not isinstance(item, dict):
+            continue
+        try:
+            index = max(0, min(127, int(item.get('index', len(gpu_summary)))))
+            power = round(max(0.0, min(5000.0, float(item.get('power', 0)))), 2)
+        except:
+            continue
+        raw_name = str(item.get('name', 'Unknown GPU'))[:96]
+        name = ''.join(
+            ch for ch in raw_name
+            if ch.isprintable() and ch not in blocked
+        ).strip() or 'Unknown GPU'
+        gpu_summary.append({"index": index, "name": name, "power": power})
+    if gpu_summary:
+        gpu_count = len(gpu_summary)
+
+    return {
+        "node_id": node_id,
+        "hostname": hostname,
+        "port": port,
+        "addresses": addresses,
+        "source_ip": source_ip,
+        "macs": macs,
+        "primary_mac": macs[0]["mac"] if macs else "-",
+        "gpu_count": gpu_count,
+        "gpu_summary": gpu_summary,
+        "_last_seen": time.monotonic(),
+    }
+
+def expire_discovered_nodes():
+    cutoff = time.monotonic() - PEER_TIMEOUT
+    with discovery_lock:
+        for node_id, node in list(discovered_nodes.items()):
+            if node.get('_last_seen', 0) < cutoff:
+                del discovered_nodes[node_id]
+
+def discovery_loop():
+    """Broadcast this node and listen for other monitors on the LAN."""
+    while True:
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            sock.bind(('', DISCOVERY_PORT))
+            next_broadcast = 0.0
+
+            while True:
+                now = time.monotonic()
+                if now >= next_broadcast:
+                    packet, broadcasts = build_discovery_announcement()
+                    for broadcast in broadcasts:
+                        try:
+                            sock.sendto(packet, (broadcast, DISCOVERY_PORT))
+                        except:
+                            pass
+                    next_broadcast = now + DISCOVERY_INTERVAL
+
+                sock.settimeout(max(0.2, min(1.0, next_broadcast - time.monotonic())))
+                try:
+                    raw, sender = sock.recvfrom(8192)
+                    payload = json.loads(raw.decode('utf-8'))
+                    if isinstance(payload, dict):
+                        node = sanitize_discovery_packet(payload, sender[0])
+                        if node:
+                            with discovery_lock:
+                                discovered_nodes[node["node_id"]] = node
+                except socket.timeout:
+                    pass
+                except:
+                    pass
+                expire_discovered_nodes()
+        except Exception as exc:
+            print(f"LAN discovery error: {exc}", file=sys.stderr, flush=True)
+            time.sleep(3)
+        finally:
+            if sock:
+                try:
+                    sock.close()
+                except:
+                    pass
+
+def get_node_directory(gpus):
+    addresses, _, macs = get_discovery_network()
+    physical_ip = next(
+        (item["ip"] for item in addresses if item.get("physical")), ""
+    )
+    now = time.monotonic()
+    current = {
+        "node_id": get_node_id(),
+        "hostname": get_hostname(),
+        "port": PORT,
+        "addresses": [item["ip"] for item in addresses],
+        "source_ip": physical_ip,
+        "macs": macs,
+        "primary_mac": macs[0]["mac"] if macs else "-",
+        "gpu_count": len(gpus),
+        "gpu_summary": [
+            {
+                "index": int(gpu.get("index", index)),
+                "name": str(gpu.get("name", "Unknown GPU"))[:96],
+                "power": round(float(gpu.get("power", 0) or 0), 2),
+            }
+            for index, gpu in enumerate(gpus[:64])
+        ],
+        "age": 0,
+        "current": True,
+    }
+
+    nodes = [current]
+    with discovery_lock:
+        for node_id, node in list(discovered_nodes.items()):
+            age = now - node.get('_last_seen', 0)
+            if age > PEER_TIMEOUT:
+                del discovered_nodes[node_id]
+                continue
+            public_node = {key: value for key, value in node.items() if not key.startswith('_')}
+            public_node["age"] = round(age, 1)
+            public_node["current"] = False
+            nodes.append(public_node)
+    nodes[1:] = sorted(nodes[1:], key=lambda item: (item["hostname"].lower(), item["source_ip"]))
+    return nodes
+
 def get_driver_info():
     if not has_nvidia():
         return {"driver": "N/A", "cuda": "N/A"}
@@ -391,7 +711,7 @@ def collect_all():
     driver = get_driver_info()
     burn_status = get_burn_status()
     return {
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "timestamp": datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S"),
         "hostname": get_hostname(),
         "uptime": get_uptime(),
         "driver": driver,
@@ -409,6 +729,7 @@ def collect_all():
         "has_gpu": len(gpus) > 0,
         "burn_status": {str(k): v for k, v in burn_status.items()},
         "network": [{"name": n["name"], "rx": fmt_bytes(n["rx"]), "tx": fmt_bytes(n["tx"]), "ip": n["ip"], "speed": n["speed"], "mac": n["mac"]} for n in net],
+        "nodes": get_node_directory(gpus),
     }
 
 HTML_PAGE = '''<!DOCTYPE html>
@@ -455,6 +776,82 @@ body{
   min-height:100vh;
   -webkit-font-smoothing:antialiased;
 }
+.app-shell{min-height:100vh}
+.node-sidebar{
+  position:fixed;
+  inset:0 auto 0 0;
+  width:232px;
+  padding:22px 16px;
+  background:rgba(8,13,24,0.97);
+  border-right:1px solid var(--border);
+  box-shadow:12px 0 36px rgba(0,0,0,0.2);
+  overflow-y:auto;
+  z-index:20;
+}
+.node-brand{padding:4px 8px 20px;border-bottom:1px solid var(--border);margin-bottom:14px}
+.node-brand-title{font-size:15px;font-weight:700;letter-spacing:0.6px;color:var(--text)}
+.node-brand-meta{display:flex;align-items:center;justify-content:space-between;margin-top:6px;color:var(--text-secondary);font-size:10px}
+.node-count{color:var(--accent);font-family:'JetBrains Mono',monospace}
+.node-list{display:flex;flex-direction:column;gap:8px}
+.node-item{
+  width:100%;
+  display:block;
+  padding:12px;
+  color:var(--text);
+  font:inherit;
+  text-align:left;
+  text-decoration:none;
+  background:rgba(15,23,42,0.72);
+  border:1px solid transparent;
+  border-radius:11px;
+  transition:background 0.2s ease,border-color 0.2s ease,transform 0.2s ease;
+}
+.node-item:is(a,button){cursor:pointer}
+.node-item:is(a,button):hover{background:var(--card-hover);border-color:var(--border-2);transform:translateX(2px)}
+.node-item.active{background:var(--accent-glow);border-color:rgba(56,189,248,0.28)}
+.node-title-row{display:flex;align-items:center;gap:8px;min-width:0}
+.node-dot{width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 10px rgba(52,211,153,0.6);flex:0 0 auto}
+.node-dot.stale{background:var(--yellow);box-shadow:0 0 10px rgba(251,191,36,0.5)}
+.node-name{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.node-current{margin-left:auto;color:var(--accent);font-size:8px;letter-spacing:1px}
+.node-ip{margin-top:7px;color:var(--text-secondary);font:10px 'JetBrains Mono',monospace}
+.node-detail{margin-top:4px;color:var(--text-dim);font:9px 'JetBrains Mono',monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.node-empty{padding:18px 10px;color:var(--text-dim);font-size:11px;text-align:center}
+.overview-nav{display:flex;align-items:center;gap:10px;width:100%;padding:11px 12px;color:var(--text-secondary);font:inherit;text-align:left;background:rgba(15,23,42,.72);border:1px solid transparent;border-radius:11px;cursor:pointer;transition:background .2s ease,border-color .2s ease,transform .2s ease}
+.overview-nav:hover{color:var(--text);background:var(--card-hover);border-color:var(--border-2);transform:translateX(2px)}
+.overview-nav.active{color:var(--text);background:linear-gradient(135deg,rgba(56,189,248,.16),rgba(15,23,42,.82));border-color:rgba(56,189,248,.3)}
+.overview-nav-icon{display:grid;grid-template-columns:repeat(2,5px);gap:2px;flex:0 0 auto}
+.overview-nav-icon i{width:5px;height:5px;border-radius:1px;background:var(--accent);box-shadow:0 0 7px rgba(56,189,248,.35)}
+.overview-nav-copy{min-width:0;flex:1}
+.overview-nav-title{display:block;color:inherit;font-size:12px;font-weight:600}
+.overview-nav-meta{display:block;margin-top:2px;color:var(--text-dim);font:8px 'JetBrains Mono',monospace}
+.overview-nav-arrow{color:var(--accent);font:14px 'JetBrains Mono',monospace}
+.node-dashboard[hidden],.fleet-dashboard[hidden]{display:none!important}
+.fleet-header{margin-bottom:24px}
+.fleet-kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:16px}
+.fleet-kpi{position:relative;overflow:hidden;min-height:116px;padding:20px;background:var(--card);border:1px solid var(--border);border-radius:14px;box-shadow:0 4px 24px rgba(0,0,0,.28)}
+.fleet-kpi::after{content:'';position:absolute;inset:auto -24px -34px auto;width:90px;height:90px;border-radius:50%;background:rgba(56,189,248,.055)}
+.fleet-kpi.primary{background:linear-gradient(145deg,rgba(14,116,144,.22),rgba(15,23,42,.94));border-color:rgba(56,189,248,.24)}
+.fleet-kpi-label{color:var(--text-dim);font-size:9px;letter-spacing:1.4px}
+.fleet-kpi-value{margin-top:9px;color:var(--text);font:700 27px 'JetBrains Mono',monospace;letter-spacing:-1px}
+.fleet-kpi-value small{margin-left:5px;color:var(--accent);font:600 11px 'Outfit','Microsoft YaHei',sans-serif;letter-spacing:0}
+.fleet-kpi-note{margin-top:5px;color:var(--text-secondary);font-size:9px}
+.fleet-panels{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-bottom:20px}
+.fleet-panel{display:flex;min-width:0;flex-direction:column;padding:18px 20px;background:var(--card);border:1px solid var(--border);border-radius:14px;box-shadow:0 4px 24px rgba(0,0,0,.25)}
+.fleet-panel-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:16px;padding-bottom:11px;border-bottom:1px solid var(--border)}
+.fleet-panel-title{font-size:12px;font-weight:600;letter-spacing:.6px}
+.fleet-panel-meta{color:var(--text-dim);font:9px 'JetBrains Mono',monospace}
+.fleet-model-list,.fleet-device-list{display:flex;height:308px;min-height:308px;flex-direction:column;gap:12px;overflow-y:auto;overflow-x:hidden;padding-right:4px;scrollbar-width:thin;scrollbar-color:rgba(56,189,248,.34) rgba(2,6,23,.36)}
+.fleet-model-list::-webkit-scrollbar,.fleet-device-list::-webkit-scrollbar{width:5px}
+.fleet-model-list::-webkit-scrollbar-track,.fleet-device-list::-webkit-scrollbar-track{background:rgba(2,6,23,.36);border-radius:999px}
+.fleet-model-list::-webkit-scrollbar-thumb,.fleet-device-list::-webkit-scrollbar-thumb{background:rgba(56,189,248,.34);border-radius:999px}
+.fleet-model-row,.fleet-device-row{display:grid;height:28px;min-height:28px;grid-template-columns:minmax(0,1fr) auto;gap:7px;align-items:center}
+.fleet-row-name{min-width:0;color:var(--text);font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.fleet-row-value{color:var(--accent);font:700 10px 'JetBrains Mono',monospace}
+.fleet-bar{grid-column:1/-1;height:5px;overflow:hidden;background:rgba(2,6,23,.82);border-radius:999px}
+.fleet-bar-fill{height:100%;background:linear-gradient(90deg,var(--accent),var(--green));border-radius:inherit;box-shadow:0 0 10px rgba(56,189,248,.22)}
+.fleet-empty{padding:28px;color:var(--text-dim);font-size:11px;text-align:center}
+.dashboard-main{min-width:0;margin-left:232px}
 .container{max-width:1800px;margin:0 auto;padding:28px 32px}
 .header{display:flex;justify-content:space-between;align-items:center;padding:24px 0;border-bottom:1px solid var(--border);margin-bottom:32px;position:relative}
 .header::after{content:'';position:absolute;bottom:-1px;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,var(--accent),transparent);opacity:0.3}
@@ -789,6 +1186,14 @@ tr:last-child td{border-bottom:none}
 .temp-red{color:var(--red)}
 @media(max-width:1400px){.gpu-grid{grid-template-columns:1fr}}
 @media(max-width:1200px){.grid{grid-template-columns:1fr}.grid-3{grid-template-columns:1fr}}
+@media(max-width:900px){
+  .node-sidebar{position:sticky;inset:auto;top:0;width:100%;height:auto;padding:10px 12px;overflow:hidden}
+  .node-brand{display:flex;align-items:center;justify-content:space-between;padding:2px 4px 9px;margin-bottom:9px}
+  .node-brand-meta{gap:12px;margin-top:0}
+  .node-list{flex-direction:row;overflow-x:auto;padding-bottom:2px}
+  .node-item{min-width:190px}
+  .dashboard-main{margin-left:0}
+}
 @media(max-width:768px){
   .stats-grid{grid-template-columns:repeat(2,1fr)}
   .status-bar{grid-template-columns:repeat(2,1fr)}
@@ -808,21 +1213,344 @@ tr:last-child td{border-bottom:none}
   .status-bar{grid-template-columns:1fr}
   .burn-btn{width:100%;padding:12px}
 }
+
+/* Operations-first responsive layout */
+.container{max-width:1720px;padding:20px 24px}
+.header{padding:10px 0;margin-bottom:14px}
+.header h1{font-size:20px}
+.status-bar{
+  grid-template-columns:repeat(4,minmax(0,1fr));
+  gap:0;
+  padding:10px 14px;
+  margin-bottom:14px;
+  border-radius:12px;
+}
+.status-item{padding:7px 6px;min-width:0}
+.status-item .label{margin-bottom:4px}
+.status-item .value{font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.system-overview{
+  display:grid;
+  grid-template-columns:minmax(170px,1fr) minmax(190px,1.1fr) minmax(320px,1.65fr) minmax(190px,1fr);
+  gap:12px;
+  margin-bottom:18px;
+}
+#systemSection,#storageSection{display:contents}
+.system-overview .card{
+  min-width:0;
+  padding:16px;
+  border-radius:12px;
+  box-shadow:0 3px 16px rgba(0,0,0,0.26);
+}
+.system-overview .card.full-width{grid-column:auto}
+.system-overview .card-header{margin-bottom:12px;padding-bottom:10px}
+.system-overview .stats-grid{gap:8px}
+.system-overview .stat-box{padding:10px 8px}
+.system-overview .stat-box .stat-label{margin-bottom:6px}
+.system-overview .stat-box .stat-value{font-size:16px!important}
+.system-overview th{padding:8px 7px;font-size:8px;letter-spacing:1px}
+.system-overview td{padding:9px 7px;font-size:10px;white-space:nowrap}
+.system-overview table{table-layout:fixed}
+.network-card td{overflow:hidden;text-overflow:ellipsis}
+.storage-list{display:flex;flex-direction:column;gap:10px}
+.storage-row{padding:2px 0 10px;border-bottom:1px solid rgba(255,255,255,0.05)}
+.storage-row:last-child{padding-bottom:0;border-bottom:0}
+.storage-row-top{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.storage-device{min-width:0;color:var(--text);font:11px 'JetBrains Mono',monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.storage-percent{color:var(--accent);font:700 12px 'JetBrains Mono',monospace}
+.storage-usage{margin-top:5px;color:var(--text-secondary);font:10px 'JetBrains Mono',monospace}
+.gpu-section-heading{display:flex;align-items:end;justify-content:space-between;gap:12px;margin:2px 0 10px;padding:0 2px 9px;border-bottom:1px solid var(--border)}
+.gpu-section-heading h2{font-size:16px;letter-spacing:.5px}
+.gpu-section-meta{color:var(--text-secondary);font:10px 'JetBrains Mono',monospace}
+.gpu-column-head{
+  display:grid;
+  grid-template-columns:minmax(160px,1.15fr) repeat(4,minmax(0,.725fr)) repeat(4,minmax(0,.6875fr)) minmax(62px,.45fr);
+  gap:0;
+  padding:0 14px 7px;
+  color:var(--text-dim);
+  font-size:7px;
+  text-transform:uppercase;
+  letter-spacing:1px;
+}
+.gpu-column-head span{padding:0 9px;white-space:nowrap}
+.gpu-column-head span:first-child{padding-left:0}
+.gpu-grid{display:flex;flex-direction:column;gap:5px;margin-bottom:20px}
+.gpu-card{
+  display:grid;
+  grid-template-columns:minmax(160px,1.15fr) minmax(360px,2.9fr) minmax(340px,2.75fr) minmax(62px,.45fr);
+  align-items:center;
+  gap:8px;
+  padding:4px 12px;
+  border-radius:10px;
+}
+.gpu-card::before{width:2px}
+.gpu-header{display:flex;flex-direction:column;align-items:flex-start;justify-content:center;gap:1px;margin:0;min-width:0}
+.gpu-name{width:100%;font-size:12px;margin:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.gpu-bus{font-size:9px}
+.gpu-index{order:-1;padding:2px 7px;border-radius:6px;font-size:8px}
+.gpu-card>.stats-grid{grid-template-columns:repeat(4,minmax(0,1fr));gap:0;min-width:0}
+.gpu-card .stat-box{min-width:0;padding:3px 7px;background:transparent;border:0;border-left:1px solid rgba(255,255,255,0.055);border-radius:0;text-align:left}
+.gpu-card .stat-box:first-child{border-left:0}
+.gpu-card .stat-box .stat-label{display:none;margin-bottom:2px;font-size:7px;letter-spacing:1px}
+.gpu-card .stat-box .stat-value{font-size:15px!important;white-space:nowrap}
+.gpu-card .stat-box .stat-sub{margin-top:0;font-size:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.gpu-card .progress{height:3px;margin-top:3px}
+.gpu-card>.pcie-section{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:0;margin:0;padding:0;border:0;min-width:0}
+.gpu-card .pcie-tag{display:flex;flex-direction:column;align-items:flex-start;justify-content:center;gap:2px;min-width:0;padding:3px 7px;background:transparent;border:0;border-left:1px solid rgba(255,255,255,0.055);border-radius:0}
+.gpu-card .pcie-label{display:none;font-size:7px;letter-spacing:1px;white-space:nowrap}
+.gpu-card .pcie-value{font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}
+.gpu-actions{display:flex;justify-content:flex-end;align-items:center}
+.gpu-actions .burn-btn{width:auto;padding:7px 10px;border-radius:7px;font-size:9px;white-space:nowrap}
+.node-item:focus-visible,.burn-btn:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.footer{padding:20px 0;margin-top:20px}
+
+@media(max-width:1300px) and (min-width:901px){
+  .system-overview{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .gpu-column-head{display:none}
+  .gpu-card .stat-box .stat-label,.gpu-card .pcie-label{display:block}
+  .gpu-card{grid-template-columns:160px minmax(0,1fr);align-items:start}
+  .gpu-card>.stats-grid{grid-column:2;grid-row:1}
+  .gpu-card>.pcie-section{grid-column:2;grid-row:2}
+  .gpu-actions{grid-column:1;grid-row:2;justify-content:flex-start;align-self:end}
+}
+
+@media(max-width:900px){
+  .node-sidebar{padding:10px 12px 9px;box-shadow:0 10px 28px rgba(0,0,0,.3)}
+  .node-brand{padding:1px 3px 8px;margin-bottom:8px}
+  .node-brand-title{font-size:14px}
+  .node-list{gap:8px;scrollbar-width:none}
+  .node-list::-webkit-scrollbar{display:none}
+  .node-brand-meta{flex:0 0 auto}
+  .overview-nav{flex:0 0 190px;min-width:190px;padding:9px 10px}
+  .node-item{min-width:calc((100vw - 32px)/2);padding:9px 10px;border-radius:9px}
+  .node-ip{margin-top:4px}
+  .node-detail{margin-top:2px}
+  .container{padding:12px}
+  .header{align-items:flex-start;gap:4px;padding:10px 4px;margin-bottom:9px;text-align:left}
+  .header h1{font-size:17px;line-height:1.35;letter-spacing:.3px}
+  .header .meta{text-align:left;font-size:9px;line-height:1.4}
+  .status-bar{padding:8px 5px;margin-bottom:10px}
+  .status-item{padding:6px 3px}
+  .status-item .label{font-size:7px;letter-spacing:1px}
+  .status-item .value{font-size:10px}
+  .system-overview{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-bottom:14px}
+  .system-overview .card{padding:11px;border-radius:10px}
+  .system-overview .network-card,.system-overview .storage-card{grid-column:1/-1}
+  .system-overview .card-header{margin-bottom:8px;padding-bottom:7px}
+  .system-overview .card-title{font-size:9px;letter-spacing:1.4px}
+  .system-overview .card-badge{padding:3px 8px;font-size:7px}
+  .system-overview .stat-box{padding:7px 4px}
+  .system-overview .stat-box .stat-value{font-size:14px!important}
+  .system-overview .stat-box .stat-sub{font-size:8px}
+  .system-overview th{padding:6px 5px;font-size:7px}
+  .system-overview td{padding:7px 5px;font-size:9px}
+  .system-overview .net-traffic{display:none}
+  .storage-list{gap:7px}
+  .storage-row{padding-bottom:7px}
+  .storage-usage{margin-top:3px}
+  .gpu-section-heading{margin-top:2px;padding-bottom:7px}
+  .gpu-section-heading h2{font-size:14px}
+  .gpu-column-head{display:none}
+  .gpu-card .stat-box .stat-label,.gpu-card .pcie-label{display:block}
+  .gpu-card{display:block;padding:11px 10px 10px;border-radius:11px}
+  .gpu-header{display:flex;min-height:39px;padding-right:70px}
+  .gpu-name{font-size:12px}
+  .gpu-bus{font-size:9px}
+  .gpu-card>.stats-grid{grid-template-columns:repeat(4,minmax(0,1fr));gap:0;margin-top:8px}
+  .gpu-card .stat-box{padding:7px 4px;text-align:center}
+  .gpu-card .stat-box .stat-value{font-size:14px!important}
+  .gpu-card .stat-box .stat-sub{font-size:7px}
+  .gpu-card>.pcie-section{grid-template-columns:repeat(4,minmax(0,1fr));margin-top:7px;padding-top:7px;border-top:1px solid rgba(255,255,255,0.05)}
+  .gpu-card .pcie-tag{align-items:center;padding:5px 3px;text-align:center}
+  .gpu-card .pcie-label{font-size:6px;letter-spacing:.5px}
+  .gpu-card .pcie-value{font-size:9px}
+  .gpu-actions{position:absolute;top:11px;right:10px}
+  .gpu-actions .burn-btn{padding:6px 9px}
+  .gpu-actions .burn-btn{min-width:52px;min-height:44px}
+  .fleet-header{margin-bottom:12px}
+  .fleet-kpis{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-bottom:10px}
+  .fleet-kpi{min-height:92px;padding:14px;border-radius:11px}
+  .fleet-kpi-label{font-size:8px;letter-spacing:.8px}
+  .fleet-kpi-value{margin-top:5px;font-size:21px}
+  .fleet-kpi-note{font-size:8px}
+  .fleet-panels{grid-template-columns:1fr;gap:9px;margin-bottom:14px}
+  .fleet-panel{padding:13px;border-radius:11px}
+  .fleet-panel-head{margin-bottom:11px;padding-bottom:8px}
+  .footer{margin-top:14px;padding:16px 0}
+}
+
+@media(max-width:480px){
+  .status-bar{grid-template-columns:repeat(4,minmax(0,1fr))}
+  .system-overview .stats-grid{grid-template-columns:repeat(2,minmax(0,1fr))!important}
+  .gpu-card>.stats-grid{grid-template-columns:repeat(4,minmax(0,1fr))}
+  .gpu-actions .burn-btn{width:auto;padding:6px 9px}
+}
+
+@media(prefers-reduced-motion:reduce){
+  *,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}
+}
 </style>
 </head>
 <body>
+<div class="app-shell">
+<aside class="node-sidebar" aria-label="局域网节点">
+  <div class="node-brand">
+    <div class="node-brand-title">局域网节点</div>
+    <div class="node-brand-meta"><span>自动发现</span><span class="node-count" id="nodeCount">0 台</span></div>
+  </div>
+  <nav class="node-list" id="nodeList"><div class="node-empty">正在搜索同网段面板...</div></nav>
+</aside>
+<main class="dashboard-main">
 <div class="container">
+  <section class="node-dashboard" id="nodeDashboard">
   <div class="header">
     <h1 id="pageTitle">硬件监控面板</h1>
     <div class="meta"><span id="hostname">-</span>&nbsp;&nbsp;<span id="timestamp">-</span></div>
   </div>
   <div class="status-bar" id="statusBar"></div>
-  <div class="grid grid-3" id="systemSection"></div>
+  <div class="system-overview">
+    <div id="systemSection"></div>
+    <div id="storageSection"></div>
+  </div>
+  <div class="gpu-section-heading"><h2>GPU 监控</h2><span class="gpu-section-meta" id="gpuSectionMeta">实时状态</span></div>
+  <div class="gpu-column-head" aria-hidden="true"><span>GPU</span><span>温度</span><span>利用率</span><span>显存</span><span>功耗</span><span>风扇转速</span><span>PCIe 支持</span><span>当前链路</span><span>链路带宽</span><span>操作</span></div>
   <div class="gpu-grid" id="gpuSection"></div>
-  <div class="grid" id="storageSection"></div>
+  </section>
+  <section class="fleet-dashboard" id="fleetDashboard" aria-label="局域网数据概览" hidden></section>
   <div class="footer">Hardware Monitor · Enterprise Edition</div>
 </div>
+</main>
+</div>
 <script>
+function esc(v){
+  return String(v==null?'':v).replace(/[&<>"']/g,function(ch){
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch];
+  });
+}
+function ipv4Parts(value){
+  var parts=String(value||'').split('.');
+  if(parts.length!==4)return null;
+  var nums=parts.map(Number);
+  return nums.every(function(n){return Number.isInteger(n)&&n>=0&&n<=255})?nums:null;
+}
+function addressScore(ip){
+  var current=ipv4Parts(location.hostname),target=ipv4Parts(ip);
+  if(!target)return -1;
+  if(!current)return 0;
+  var weights=[16,8,4,2],score=0;
+  for(var i=0;i<4;i++){
+    if(current[i]!==target[i])break;
+    score+=weights[i];
+  }
+  return score;
+}
+function pickNodeIp(node){
+  var addresses=Array.isArray(node.addresses)?node.addresses.slice(0):[];
+  if(node.source_ip&&addresses.indexOf(node.source_ip)<0)addresses.push(node.source_ip);
+  var best='',bestScore=-1;
+  addresses.forEach(function(ip){
+    var score=addressScore(ip);
+    if(score>bestScore){best=ip;bestScore=score}
+  });
+  return best;
+}
+var mainView='node',latestDashboardData=null;
+function setMainView(view){
+  var nodes=latestDashboardData&&Array.isArray(latestDashboardData.nodes)?latestDashboardData.nodes:[];
+  if(view==='overview'&&nodes.length<2)view='node';
+  mainView=view;
+  var showOverview=view==='overview';
+  document.getElementById('nodeDashboard').hidden=showOverview;
+  document.getElementById('fleetDashboard').hidden=!showOverview;
+  if(latestDashboardData){
+    renderNodes(latestDashboardData);
+    if(showOverview){
+      document.title='局域网数据概览 · '+nodes.length+' 台设备';
+    }else{
+      renderStatus(latestDashboardData);
+    }
+  }
+  window.scrollTo(0,0);
+}
+function formatPower(watts){
+  watts=Number(watts||0);
+  return watts>=1000?(watts/1000).toFixed(2)+' kW':watts.toFixed(1)+' W';
+}
+function powerMarkup(watts){
+  var parts=formatPower(watts).split(' ');
+  return esc(parts[0])+'<small>'+esc(parts[1]||'W')+'</small>';
+}
+function renderOverview(d){
+  var nodes=Array.isArray(d.nodes)?d.nodes:[];
+  var dashboard=document.getElementById('fleetDashboard');
+  if(nodes.length<2){
+    dashboard.innerHTML='';
+    if(mainView==='overview')setMainView('node');
+    return;
+  }
+
+  var totalPower=0,totalGpus=0,modelCounts={},machines=[];
+  nodes.forEach(function(node){
+    var gpus=Array.isArray(node.gpu_summary)?node.gpu_summary:[];
+    var count=Math.max(Number(node.gpu_count||0),gpus.length);
+    var machinePower=0;
+    totalGpus+=count;
+    gpus.forEach(function(gpu){
+      var power=Math.max(0,Number(gpu.power||0));
+      var name=String(gpu.name||'Unknown GPU');
+      machinePower+=power;
+      modelCounts[name]=(modelCounts[name]||0)+1;
+    });
+    totalPower+=machinePower;
+    var missing=Math.max(0,count-gpus.length);
+    if(missing){modelCounts['数据待同步']=(modelCounts['数据待同步']||0)+missing}
+    machines.push({node:node,count:count,power:machinePower});
+  });
+
+  var models=Object.keys(modelCounts).sort(function(a,b){return modelCounts[b]-modelCounts[a]});
+  var modelHtml=models.map(function(name){
+    var count=modelCounts[name],percent=totalGpus?count/totalGpus*100:0;
+    return '<div class="fleet-model-row"><span class="fleet-row-name" title="'+esc(name)+'">'+esc(name)+'</span><span class="fleet-row-value">×'+count+'</span><div class="fleet-bar"><div class="fleet-bar-fill" style="width:'+percent.toFixed(1)+'%"></div></div></div>';
+  }).join('');
+  var maxMachinePower=Math.max.apply(null,machines.map(function(machine){return machine.power}).concat([1]));
+  var deviceHtml=machines.map(function(machine){
+    var percent=machine.power/maxMachinePower*100;
+    return '<div class="fleet-device-row"><span class="fleet-row-name"><span class="node-dot"></span>&nbsp;'+esc(machine.node.hostname)+'</span><span class="fleet-row-value">'+formatPower(machine.power)+'</span><div class="fleet-bar"><div class="fleet-bar-fill" style="width:'+percent.toFixed(1)+'%"></div></div></div>';
+  }).join('');
+  var averagePower=totalGpus?totalPower/totalGpus:0;
+  dashboard.innerHTML='<div class="header fleet-header"><h1>局域网数据概览</h1><div class="meta"><span>'+nodes.length+' 台设备在线</span>&nbsp;&nbsp;<span>'+esc(d.timestamp)+'</span></div></div>'+
+    '<div class="fleet-kpis">'+
+      '<div class="fleet-kpi primary"><div class="fleet-kpi-label">GPU 实时总功耗</div><div class="fleet-kpi-value">'+powerMarkup(totalPower)+'</div><div class="fleet-kpi-note">全局每 5 秒自动刷新</div></div>'+
+      '<div class="fleet-kpi"><div class="fleet-kpi-label">在线设备</div><div class="fleet-kpi-value">'+nodes.length+'<small>台</small></div><div class="fleet-kpi-note">局域网自动发现</div></div>'+
+      '<div class="fleet-kpi"><div class="fleet-kpi-label">显卡总数</div><div class="fleet-kpi-value">'+totalGpus+'<small>张</small></div><div class="fleet-kpi-note">'+models.length+' 种 GPU 型号</div></div>'+
+      '<div class="fleet-kpi"><div class="fleet-kpi-label">单卡平均功耗</div><div class="fleet-kpi-value">'+powerMarkup(averagePower)+'</div><div class="fleet-kpi-note">按当前实时功耗计算</div></div>'+
+    '</div>'+
+    '<div class="fleet-panels"><section class="fleet-panel"><div class="fleet-panel-head"><span class="fleet-panel-title">显卡型号分布</span><span class="fleet-panel-meta">'+totalGpus+' 张</span></div><div class="fleet-model-list">'+(modelHtml||'<div class="fleet-empty">暂无显卡数据</div>')+'</div></section>'+
+      '<section class="fleet-panel"><div class="fleet-panel-head"><span class="fleet-panel-title">设备功耗对比</span><span class="fleet-panel-meta">实时</span></div><div class="fleet-device-list">'+deviceHtml+'</div></section></div>';
+}
+function renderNodes(d){
+  var nodes=Array.isArray(d.nodes)?d.nodes:[];
+  document.getElementById('nodeCount').textContent=nodes.length+' 台';
+  if(!nodes.length){
+    document.getElementById('nodeList').innerHTML='<div class="node-empty">暂未发现节点</div>';
+    return;
+  }
+  var overviewNav=nodes.length>=2?'<button class="overview-nav'+(mainView==='overview'?' active':'')+'" id="overviewNav" type="button" data-main-view="overview"'+(mainView==='overview'?' aria-current="page"':'')+'><span class="overview-nav-icon" aria-hidden="true"><i></i><i></i><i></i><i></i></span><span class="overview-nav-copy"><span class="overview-nav-title">数据概览</span><span class="overview-nav-meta">'+nodes.length+' 台设备 · 局域网汇总</span></span><span class="overview-nav-arrow">›</span></button>':'';
+  document.getElementById('nodeList').innerHTML=overviewNav+nodes.map(function(node){
+    var targetIp=node.current?location.hostname:pickNodeIp(node);
+    var displayIp=node.source_ip||((Array.isArray(node.addresses)&&node.addresses.length)?node.addresses[0]:targetIp);
+    var stale=!node.current&&Number(node.age||0)>10;
+    var detail='GPU '+Number(node.gpu_count||0)+' · '+String(node.primary_mac||'-');
+    var inner='<div class="node-title-row"><span class="node-dot'+(stale?' stale':'')+'"></span>'+
+      '<span class="node-name">'+esc(node.hostname)+'</span>'+
+      (node.current?'<span class="node-current">当前</span>':'')+'</div>'+
+      '<div class="node-ip">'+esc(displayIp||'无可用地址')+'</div>'+
+      '<div class="node-detail">'+esc(detail)+'</div>';
+    if(node.current)return '<button class="node-item'+(mainView==='node'?' active':'')+'" id="currentNodeNav" type="button" data-main-view="node"'+(mainView==='node'?' aria-current="page"':'')+'>'+inner+'</button>';
+    if(!targetIp)return '<div class="node-item">'+inner+'</div>';
+    var url='http://'+targetIp+':'+Number(node.port||8889)+'/';
+    return '<a class="node-item" href="'+esc(url)+'" aria-label="切换到 '+esc(node.hostname)+'">'+inner+'</a>';
+  }).join('');
+}
 function pctClass(v){return v>90?'red':v>70?'yellow':'green'}
 function pctTag(v){return '<span class="tag tag-'+pctClass(v)+'">'+v.toFixed(1)+'%</span>'}
 function progress(v,c){return '<div class="progress"><div class="progress-fill fill-'+(c||pctClass(v))+'" style="width:'+Math.min(v,100)+'%"></div></div>'}
@@ -835,7 +1563,7 @@ function renderStatus(d){
   var title=d.hostname;
   if(d.has_gpu){title+=' · '+d.gpus[0].name+' x'+d.gpus.length}
   document.getElementById('pageTitle').textContent=title;
-  document.title=title;
+  document.title=mainView==='overview'?'局域网数据概览 · '+(Array.isArray(d.nodes)?d.nodes.length:0)+' 台设备':title;
   var html='<div class="status-item"><div class="label">主机名</div><div class="value">'+d.hostname+'</div></div>'+
     '<div class="status-item"><div class="label">运行时间</div><div class="value">'+d.uptime+'</div></div>';
   if(d.has_gpu){
@@ -849,24 +1577,25 @@ function renderStatus(d){
 function renderSystem(d){
   var cpu=d.cpu,mem=d.memory,mf=d.memory_fmt;
   document.getElementById('systemSection').innerHTML=
-    '<div class="card"><div class="card-header"><span class="card-title">处理器</span><span class="card-badge">CPU</span></div>'+
+    '<div class="card system-card cpu-card"><div class="card-header"><span class="card-title">处理器</span><span class="card-badge">CPU</span></div>'+
     '<div class="stats-grid" style="grid-template-columns:repeat(2,1fr)">'+
     '<div class="stat-box"><div class="stat-label">核心 / 线程</div><div class="stat-value">'+cpu.cores+' / '+cpu.threads+'</div></div>'+
     '<div class="stat-box"><div class="stat-label">频率</div><div class="stat-value">'+cpu.freq+'</div></div>'+
     '</div></div>'+
-    '<div class="card"><div class="card-header"><span class="card-title">内存</span><span class="card-badge">RAM</span></div>'+
+    '<div class="card system-card memory-card"><div class="card-header"><span class="card-title">内存</span><span class="card-badge">RAM</span></div>'+
     '<div class="stats-grid" style="grid-template-columns:repeat(2,1fr)">'+
     '<div class="stat-box"><div class="stat-label">已用 / 总计</div><div class="stat-value" style="font-size:16px">'+mf.used+'</div><div class="stat-sub">'+mf.total+'</div>'+progress(mem.percent)+'</div>'+
     '<div class="stat-box"><div class="stat-label">可用</div><div class="stat-value" style="font-size:16px">'+mf.available+'</div><div class="stat-sub">'+mem.percent+'% 已用</div></div>'+
     '</div></div>'+
-    '<div class="card"><div class="card-header"><span class="card-title">物理网卡</span><span class="card-badge">NET</span></div>'+
-    '<table><thead><tr><th>接口</th><th>IP 地址</th><th>速率</th><th>接收</th><th>发送</th></tr></thead><tbody>'+
-    d.network.map(function(n){return '<tr><td>'+n.name+'</td><td>'+n.ip+'</td><td>'+n.speed+'</td><td>'+n.rx+'</td><td>'+n.tx+'</td></tr>'}).join('')+
+    '<div class="card system-card network-card"><div class="card-header"><span class="card-title">物理网卡</span><span class="card-badge">NET</span></div>'+
+    '<table><thead><tr><th>接口</th><th>IP 地址</th><th>速率</th><th class="net-traffic">接收</th><th class="net-traffic">发送</th></tr></thead><tbody>'+
+    d.network.map(function(n){return '<tr><td>'+n.name+'</td><td>'+n.ip+'</td><td>'+n.speed+'</td><td class="net-traffic">'+n.rx+'</td><td class="net-traffic">'+n.tx+'</td></tr>'}).join('')+
     '</tbody></table></div>';
 }
 
 function renderGPUs(d){
   var el=document.getElementById('gpuSection');
+  document.getElementById('gpuSectionMeta').textContent=d.has_gpu?d.gpus.length+' 张显卡 · 5 秒刷新':'未检测到显卡';
   if(!d.has_gpu){el.innerHTML='<div class="card full-width"><div class="no-gpu">未检测到 NVIDIA GPU 或驱动未就绪</div></div>';return}
   el.innerHTML=d.gpus.map(function(g){
     var memPct=g.mem_total>0?g.mem_used/g.mem_total*100:0;
@@ -877,7 +1606,7 @@ function renderGPUs(d){
     var burnLabel=isBurning?'\u26a0 压测中 ('+Math.floor(bs.remaining/60)+'分'+bs.remaining%60+'秒)':'压测';
     var burnClass=isBurning?'burn-btn burning':'burn-btn';
     return '<div class="gpu-card">'+
-      '<div class="gpu-header"><div><div class="gpu-name">'+g.name+'</div><div class="gpu-bus">Bus: '+g.bus_id+'</div></div><div style="display:flex;gap:10px;align-items:center"><button class="'+burnClass+'" onclick="toggleBurn('+g.index+','+!!isBurning+')">'+burnLabel+'</button><div class="gpu-index">GPU '+g.index+'</div></div></div>'+
+      '<div class="gpu-header"><div class="gpu-index">GPU '+g.index+'</div><div class="gpu-name">'+g.name+'</div><div class="gpu-bus">Bus: '+g.bus_id+'</div></div>'+
       '<div class="stats-grid">'+
       '<div class="stat-box"><div class="stat-label">温度</div><div class="stat-value '+tempClass(g.temp)+'">'+g.temp+'\u00b0C</div></div>'+
       '<div class="stat-box"><div class="stat-label">利用率</div><div class="stat-value">'+g.util+'%</div>'+progress(g.util)+'</div>'+
@@ -885,19 +1614,21 @@ function renderGPUs(d){
       '<div class="stat-box"><div class="stat-label">功耗</div><div class="stat-value" style="font-size:18px">'+g.power+'W</div><div class="stat-sub">上限 '+g.power_limit+'W</div>'+progress(pwrPct)+'</div>'+
       '</div>'+
       '<div class="pcie-section">'+
+      '<div class="pcie-tag"><span class="pcie-label">风扇转速</span><span class="pcie-value">'+g.fan+'%</span></div>'+
       '<div class="pcie-tag"><span class="pcie-label">PCIe 支持</span><span class="pcie-value">'+p.cap_gen_display+'</span></div>'+
       '<div class="pcie-tag"><span class="pcie-label">当前链路</span><span class="pcie-value" style="'+pcieWarn(p.sta_gen_display)+'">'+p.sta_gen_display+'</span></div>'+
       '<div class="pcie-tag"><span class="pcie-label">链路带宽</span><span class="pcie-value">'+p.bandwidth+'</span></div>'+
-      '</div></div>';
+      '</div><div class="gpu-actions"><button class="'+burnClass+'" onclick="toggleBurn('+g.index+','+!!isBurning+')">'+burnLabel+'</button></div></div>';
   }).join('');
 }
 
 function renderStorage(d){
   document.getElementById('storageSection').innerHTML=
-    '<div class="card full-width"><div class="card-header"><span class="card-title">存储设备</span><span class="card-badge">'+d.disks.length+' 分区</span></div>'+
-    '<table><thead><tr><th>设备</th><th>挂载点</th><th>已用</th><th>总量</th><th>使用率</th><th style="width:140px"></th></tr></thead><tbody>'+
-    d.disks.map(function(dk){return '<tr><td>'+dk.device+'</td><td>'+dk.mount+'</td><td>'+dk.used+'</td><td>'+dk.total+'</td><td>'+pctTag(dk.percent)+'</td><td>'+progress(dk.percent)+'</td></tr>'}).join('')+
-    '</tbody></table></div>';
+    '<div class="card system-card storage-card"><div class="card-header"><span class="card-title">存储</span><span class="card-badge">'+d.disks.length+' 分区</span></div>'+
+    '<div class="storage-list">'+d.disks.map(function(dk){return '<div class="storage-row">'+
+      '<div class="storage-row-top"><span class="storage-device">'+dk.device+' · '+dk.mount+'</span><span class="storage-percent">'+dk.percent.toFixed(1)+'%</span></div>'+
+      '<div class="storage-usage">'+dk.used+' / '+dk.total+'</div>'+progress(dk.percent)+'</div>'}).join('')+
+    '</div></div>';
 }
 
 async function toggleBurn(idx,running){
@@ -915,8 +1646,12 @@ async function toggleBurn(idx,running){
 }
 
 async function refresh(){
-  try{var r=await fetch('/api/data');var d=await r.json();renderStatus(d);renderSystem(d);renderGPUs(d);renderStorage(d);}catch(e){console.error(e)}
+  try{var r=await fetch('/api/data');var d=await r.json();latestDashboardData=d;renderNodes(d);renderOverview(d);renderStatus(d);renderSystem(d);renderGPUs(d);renderStorage(d);}catch(e){console.error(e)}
 }
+document.getElementById('nodeList').addEventListener('click',function(event){
+  var button=event.target.closest('[data-main-view]');
+  if(button)setMainView(button.getAttribute('data-main-view'));
+});
 refresh();setInterval(refresh,5000);
 </script>
 </body>
@@ -963,10 +1698,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
 
 if __name__ == '__main__':
-    server = http.server.HTTPServer(('0.0.0.0', PORT), Handler)
+    threading.Thread(target=discovery_loop, name='lan-discovery', daemon=True).start()
+    server = http.server.ThreadingHTTPServer(('0.0.0.0', PORT), Handler)
     print(f"Hardware Monitor running on http://0.0.0.0:{PORT}")
     server.serve_forever()
-
 SERVER_EOF
 
 echo "[*] Deploy TTY kiosk script..."
