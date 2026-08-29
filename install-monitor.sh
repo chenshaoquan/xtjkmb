@@ -88,6 +88,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -129,6 +130,8 @@ ISSUE_MESSAGES_ZH = {
     "PCI_MISSING": "基线中的显卡已从 PCIe 总线消失",
     "TOPOLOGY_CHANGED": "检测到基线之外的显卡，请确认后刷新基线",
 }
+VM_MESSAGE = "GPU is assigned to a running virtual machine"
+VM_MESSAGE_ZH = "显卡已直通给运行中的虚拟机"
 
 
 def run_command(args, timeout=8):
@@ -266,6 +269,82 @@ def get_link_info(bus_id):
     }
 
 
+def get_kernel_driver(bus_id):
+    driver_link = Path("/sys/bus/pci/devices") / normalize_bus_id(bus_id) / "driver"
+    try:
+        if not driver_link.exists():
+            return ""
+        return Path(os.path.realpath(driver_link)).name
+    except OSError:
+        return ""
+
+
+def parse_vm_hostdevs(xml_text, vm_name):
+    assignments = {}
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return assignments
+    for hostdev in root.findall(".//devices/hostdev"):
+        if hostdev.get("type") != "pci":
+            continue
+        address = hostdev.find("./source/address")
+        if address is None:
+            continue
+        try:
+            domain = int(address.get("domain", "0"), 0)
+            bus = int(address.get("bus", "0"), 0)
+            slot = int(address.get("slot", "0"), 0)
+            function = int(address.get("function", "0"), 0)
+        except (TypeError, ValueError):
+            continue
+        bus_id = normalize_bus_id(f"{domain:04x}:{bus:02x}:{slot:02x}.{function:x}")
+        assignments[bus_id] = {"vm_name": vm_name, "source": "libvirt"}
+    return assignments
+
+
+def collect_vm_passthrough_gpus():
+    """Return PCI devices assigned to running libvirt/QEMU virtual machines."""
+    assignments = {}
+    rc, names_out, _ = run_command(
+        ["virsh", "list", "--state-running", "--name"], timeout=8
+    )
+    if rc == 0:
+        for vm_name in [line.strip() for line in names_out.splitlines() if line.strip()]:
+            xml_rc, xml_out, _ = run_command(["virsh", "dumpxml", vm_name], timeout=8)
+            if xml_rc == 0 and xml_out:
+                assignments.update(parse_vm_hostdevs(xml_out, vm_name))
+
+    # VAST normally uses libvirt. This fallback also covers directly launched QEMU VMs.
+    try:
+        proc_dirs = list(Path("/proc").glob("[0-9]*/cmdline"))
+    except OSError:
+        proc_dirs = []
+    for cmdline_path in proc_dirs:
+        try:
+            raw = cmdline_path.read_bytes()
+        except OSError:
+            continue
+        args = [part.decode("utf-8", "replace") for part in raw.split(b"\0") if part]
+        if not args or not Path(args[0]).name.startswith("qemu-system-"):
+            continue
+        vm_name = "QEMU VM"
+        for index, value in enumerate(args[:-1]):
+            if value == "-name":
+                name_value = args[index + 1]
+                match = re.search(r"(?:^|,)guest=([^,]+)", name_value)
+                vm_name = match.group(1) if match else name_value.split(",", 1)[0]
+                break
+        for value in args:
+            for match in re.finditer(
+                r"(?:^|,)host=((?:[0-9a-fA-F]{4}:)?[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7])(?:,|$)",
+                value,
+            ):
+                bus_id = normalize_bus_id(match.group(1))
+                assignments.setdefault(bus_id, {"vm_name": vm_name, "source": "qemu"})
+    return assignments
+
+
 def collect_physical_gpus():
     _, lspci_out, _ = run_command(["lspci", "-D"], timeout=8)
     _, dmi_out, _ = run_command(["dmidecode", "-t", "slot"], timeout=12)
@@ -273,6 +352,7 @@ def collect_physical_gpus():
     physical = parse_lspci(lspci_out)
     for gpu in physical:
         gpu["slot"] = resolve_slot(gpu["bus_id"], slot_map)
+        gpu["kernel_driver"] = get_kernel_driver(gpu["bus_id"])
         gpu.update(get_link_info(gpu["bus_id"]))
     return physical
 
@@ -381,51 +461,97 @@ def make_issue(code, gpu=None):
     }
 
 
-def evaluate_health(baseline, baseline_error, physical, driver_available, driver):
+def evaluate_health(
+    baseline,
+    baseline_error,
+    physical,
+    driver_available,
+    driver,
+    vm_assignments=None,
+):
     expected = baseline.get("gpus", []) if baseline else []
     physical_map = {normalize_bus_id(gpu["bus_id"]): gpu for gpu in physical}
     driver_map = {normalize_bus_id(gpu["bus_id"]): gpu for gpu in driver}
+    vm_assignments = {
+        normalize_bus_id(bus_id): value
+        for bus_id, value in (vm_assignments or {}).items()
+    }
     issues = []
+
+    model_aliases = {}
+    for bus_id, driver_gpu in driver_map.items():
+        physical_gpu = physical_map.get(bus_id)
+        if physical_gpu and physical_gpu.get("model") and driver_gpu.get("name"):
+            model_aliases[physical_gpu["model"]] = driver_gpu["name"]
+
+    vm_gpus = []
+    for bus_id, assignment in vm_assignments.items():
+        current = physical_map.get(bus_id)
+        if current is None:
+            continue
+        merged = dict(current)
+        if merged.get("model") in model_aliases:
+            merged["model"] = model_aliases[merged["model"]]
+        vm_gpus.append(
+            {
+                "code": "VM_PASSTHROUGH",
+                "model": merged.get("model") or "NVIDIA GPU",
+                "bus_id": bus_id,
+                "slot": normalize_slot_name(merged.get("slot")) or "-",
+                "vm_name": str(assignment.get("vm_name") or "QEMU VM"),
+                "message": VM_MESSAGE_ZH,
+                "message_ascii": VM_MESSAGE,
+            }
+        )
+    vm_gpus.sort(key=lambda item: item["bus_id"])
+    vm_bus_ids = {item["bus_id"] for item in vm_gpus}
 
     if baseline_error:
         issues.append(make_issue(baseline_error))
-    if not driver_available:
+    expected_buses = {normalize_bus_id(gpu["bus_id"]) for gpu in expected}
+    non_vm_expected_on_pci = {
+        bus_id for bus_id in expected_buses
+        if bus_id in physical_map and bus_id not in vm_bus_ids
+    }
+    if not driver_available and (non_vm_expected_on_pci or not expected):
         issues.append(make_issue("DRIVER_UNAVAILABLE"))
 
+    missing_buses = set()
     for gpu in expected:
         bus_id = normalize_bus_id(gpu["bus_id"])
         current = physical_map.get(bus_id)
         if current is None:
             issues.append(make_issue("PCI_MISSING", gpu))
+            missing_buses.add(bus_id)
+        elif bus_id in vm_bus_ids:
+            continue
         elif driver_available and bus_id not in driver_map:
             merged = dict(gpu)
             merged.update(current)
+            if merged.get("model") in model_aliases:
+                merged["model"] = model_aliases[merged["model"]]
             issues.append(make_issue("DRIVER_MISSING", merged))
+            missing_buses.add(bus_id)
+        elif not driver_available:
+            missing_buses.add(bus_id)
 
-    expected_buses = {normalize_bus_id(gpu["bus_id"]) for gpu in expected}
     if baseline:
         for bus_id, gpu in physical_map.items():
             if bus_id not in expected_buses:
                 issues.append(make_issue("TOPOLOGY_CHANGED", gpu))
-
-    if not driver_available and expected:
-        missing_count = len(expected)
-    else:
-        missing_count = sum(
-            item["code"] in {"DRIVER_MISSING", "PCI_MISSING"}
-            for item in issues
-        )
 
     return {
         "status": "pass" if not issues else "fail",
         "expected_count": len(expected),
         "pci_count": len(physical),
         "driver_count": len(driver) if driver_available else 0,
-        "missing_count": missing_count,
+        "vm_count": len(vm_gpus),
+        "missing_count": len(missing_buses),
         "driver_available": driver_available,
         "issues": issues,
         "physical_gpus": physical,
         "driver_gpus": driver,
+        "vm_gpus": vm_gpus,
         "checked_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -434,12 +560,14 @@ def collect_health(baseline_path=DEFAULT_BASELINE):
     baseline, baseline_error = load_baseline(baseline_path)
     physical = collect_physical_gpus()
     driver_available, driver, _ = collect_driver_gpus()
+    vm_assignments = collect_vm_passthrough_gpus()
     return evaluate_health(
         baseline,
         baseline_error,
         physical,
         driver_available,
         driver,
+        vm_assignments,
     )
 
 
@@ -461,29 +589,63 @@ def ensure_baseline(path):
 
 
 def format_tty(health):
-    physical_map = {gpu["bus_id"]: gpu for gpu in health["physical_gpus"]}
+    physical_map = {
+        normalize_bus_id(gpu["bus_id"]): gpu for gpu in health["physical_gpus"]
+    }
+    driver_map = {
+        normalize_bus_id(gpu["bus_id"]): gpu for gpu in health["driver_gpus"]
+    }
+    vm_map = {
+        normalize_bus_id(gpu["bus_id"]): gpu for gpu in health.get("vm_gpus", [])
+    }
     lines = [
         "  --------------------------------------------",
         "  GPU",
         "  --------------------------------------------",
-        "  " + f"{'ID':<5}{'MODEL':<27}{'BUS':<14}{'SLOT':<16}{'CURRENT':<12}{'POWER':<10}{'TEMP':<7}",
+        "  " + f"{'ID':<5}{'MODEL':<27}{'BUS':<14}{'SLOT':<16}{'DRIVER':<8}{'CURRENT':<12}{'POWER':<10}{'TEMP':<7}",
     ]
-    for driver in health["driver_gpus"]:
-        physical = physical_map.get(driver["bus_id"], {})
+    rendered_driver_buses = set()
+    for bus_id, physical in sorted(physical_map.items()):
+        driver = driver_map.get(bus_id)
+        vm_gpu = vm_map.get(bus_id)
+        if driver:
+            row_id = str(driver["index"])
+            model = driver["name"]
+            driver_label = "NVIDIA"
+            power = f"{driver['power']} W" if driver["power"] != "N/A" else "N/A"
+            temp = f"{driver['temp']} C" if driver["temp"] != "N/A" else "N/A"
+            rendered_driver_buses.add(bus_id)
+        elif vm_gpu:
+            row_id = "VM"
+            model = vm_gpu["model"]
+            driver_label = "VM"
+            power = "-"
+            temp = "-"
+        else:
+            continue
         slot = physical.get("slot", "UNMATCHED")
         current_link = physical.get("current_link", "N/A")
+        lines.append(
+            "  "
+            + f"{row_id:<5}{model[:26]:<27}{bus_id:<14}{slot[:14]:<16}"
+            + f"{driver_label:<8}{current_link:<12}{power:<10}{temp:<7}"
+        )
+
+    for bus_id, driver in sorted(driver_map.items()):
+        if bus_id in rendered_driver_buses:
+            continue
         power = f"{driver['power']} W" if driver["power"] != "N/A" else "N/A"
         temp = f"{driver['temp']} C" if driver["temp"] != "N/A" else "N/A"
         lines.append(
             "  "
-            + f"{driver['index']:<5}{driver['name'][:25]:<27}{driver['bus_id']:<14}"
-            + f"{slot[:14]:<16}{current_link:<12}{power:<10}{temp:<7}"
+            + f"{driver['index']:<5}{driver['name'][:26]:<27}{bus_id:<14}"
+            + f"{'UNMATCHED':<16}{'NVIDIA':<8}{'N/A':<12}{power:<10}{temp:<7}"
         )
 
     summary = (
         f"  GPU HEALTH: {health['status'].upper()}  "
         f"EXPECTED={health['expected_count']}  PCI={health['pci_count']}  "
-        f"DRIVER={health['driver_count']}"
+        f"DRIVER={health['driver_count']}  VM={health.get('vm_count', 0)}"
     )
     if health["issues"]:
         lines.extend([
@@ -548,7 +710,44 @@ System Slot Information
     failed_tty = format_tty(health)
     assert "GPU HEALTH:" not in failed_tty
     assert "CPU1 SLOT8" in failed_tty and "DRIVER_MISSING" in failed_tty
-    assert "MAX" not in failed_tty and "CURRENT" in failed_tty
+    assert "MAX" not in failed_tty and "CURRENT" in failed_tty and "DRIVER" in failed_tty
+
+    vm_xml = """
+<domain><devices><hostdev mode='subsystem' type='pci' managed='yes'><source>
+<address domain='0x0000' bus='0x04' slot='0x00' function='0x0'/>
+</source></hostdev></devices></domain>
+"""
+    parsed_vm = parse_vm_hostdevs(vm_xml, "C.49072028")
+    assert parsed_vm["0000:04:00.0"]["vm_name"] == "C.49072028"
+    vm_health = evaluate_health(
+        expected,
+        "",
+        current,
+        True,
+        driver,
+        {"0000:04:00.0": {"vm_name": "C.49072028", "source": "libvirt"}},
+    )
+    assert vm_health["status"] == "pass"
+    assert vm_health["missing_count"] == 0 and vm_health["vm_count"] == 1
+    assert vm_health["vm_gpus"][0]["code"] == "VM_PASSTHROUGH"
+    vm_tty = format_tty(vm_health)
+    assert "DRIVER=1  VM=1" in vm_tty
+    assert "VM" in vm_tty and "C.49072028" not in vm_tty
+
+    all_vm = evaluate_health(
+        expected,
+        "",
+        current,
+        False,
+        [],
+        {
+            "0000:04:00.0": {"vm_name": "vm-a"},
+            "0000:05:00.0": {"vm_name": "vm-a"},
+        },
+    )
+    assert all_vm["status"] == "pass"
+    assert all_vm["driver_count"] == 0 and all_vm["vm_count"] == 2
+    assert all_vm["missing_count"] == 0
 
     pci_missing = evaluate_health(expected, "", current[1:], True, driver)
     assert pci_missing["issues"][0]["code"] == "PCI_MISSING"
@@ -1052,10 +1251,73 @@ def get_gpu_power_summary_quick():
             continue
     return summary
 
+def get_gpu_model_inventory(gpu_health, gpu_summary=None):
+    """Return physical GPU model totals, including VM and PCI-missing cards."""
+    physical = gpu_health.get("physical_gpus", []) if isinstance(gpu_health, dict) else []
+    driver_gpus = gpu_health.get("driver_gpus", []) if isinstance(gpu_health, dict) else []
+    vm_gpus = gpu_health.get("vm_gpus", []) if isinstance(gpu_health, dict) else []
+    issues = gpu_health.get("issues", []) if isinstance(gpu_health, dict) else []
+    physical_by_bus = {
+        normalize_bus_id(item.get("bus_id")): item
+        for item in physical if isinstance(item, dict) and item.get("bus_id")
+    }
+    driver_by_bus = {
+        normalize_bus_id(item.get("bus_id")): item
+        for item in driver_gpus if isinstance(item, dict) and item.get("bus_id")
+    }
+    vm_by_bus = {
+        normalize_bus_id(item.get("bus_id")): item
+        for item in vm_gpus if isinstance(item, dict) and item.get("bus_id")
+    }
+    model_aliases = {}
+    for bus_id, item in driver_by_bus.items():
+        physical_item = physical_by_bus.get(bus_id)
+        if physical_item and physical_item.get("model") and item.get("name"):
+            model_aliases[str(physical_item["model"])] = str(item["name"])
+    for bus_id, item in vm_by_bus.items():
+        physical_item = physical_by_bus.get(bus_id)
+        if physical_item and physical_item.get("model") and item.get("model"):
+            model_aliases[str(physical_item["model"])] = str(item["model"])
+
+    counts = {}
+    counted_buses = set()
+    for bus_id, item in physical_by_bus.items():
+        driver_item = driver_by_bus.get(bus_id)
+        vm_item = vm_by_bus.get(bus_id)
+        raw_model = str(item.get("model") or "NVIDIA GPU")
+        model = (
+            str(driver_item.get("name")) if driver_item and driver_item.get("name")
+            else str(vm_item.get("model")) if vm_item and vm_item.get("model")
+            else model_aliases.get(raw_model, raw_model)
+        )
+        counts[model] = counts.get(model, 0) + 1
+        counted_buses.add(bus_id)
+
+    for issue in issues:
+        if not isinstance(issue, dict) or issue.get("code") != "PCI_MISSING":
+            continue
+        bus_id = normalize_bus_id(issue.get("bus_id"))
+        if not bus_id or bus_id in counted_buses:
+            continue
+        raw_model = str(issue.get("model") or "NVIDIA GPU")
+        model = model_aliases.get(raw_model, raw_model)
+        counts[model] = counts.get(model, 0) + 1
+        counted_buses.add(bus_id)
+
+    if not counts:
+        for item in gpu_summary or []:
+            model = str(item.get("name") or "NVIDIA GPU")
+            counts[model] = counts.get(model, 0) + 1
+    return [
+        {"name": name[:96], "count": count}
+        for name, count in sorted(counts.items(), key=lambda pair: (-pair[1], pair[0]))
+    ]
+
 def build_discovery_announcement():
     addresses, broadcasts, macs = get_discovery_network()
     gpu_summary = get_gpu_power_summary_quick()
     gpu_health = collect_health()
+    gpu_model_inventory = get_gpu_model_inventory(gpu_health, gpu_summary)
     payload = {
         "protocol": DISCOVERY_PROTOCOL,
         "version": DISCOVERY_VERSION,
@@ -1066,10 +1328,12 @@ def build_discovery_announcement():
         "macs": macs,
         "gpu_count": gpu_health.get("expected_count") or len(gpu_summary),
         "gpu_summary": gpu_summary,
+        "gpu_model_inventory": gpu_model_inventory,
         "gpu_health_status": gpu_health.get("status", "fail"),
         "gpu_expected_count": gpu_health.get("expected_count", 0),
         "gpu_pci_count": gpu_health.get("pci_count", 0),
         "gpu_driver_count": gpu_health.get("driver_count", 0),
+        "gpu_vm_count": gpu_health.get("vm_count", 0),
         "gpu_issue_count": len(gpu_health.get("issues", [])),
         "gpu_missing_count": gpu_health.get("missing_count", 0),
         "timestamp": int(time.time()),
@@ -1136,6 +1400,25 @@ def sanitize_discovery_packet(payload, source_ip):
     if gpu_summary:
         gpu_count = max(gpu_count, len(gpu_summary))
 
+    gpu_model_inventory = []
+    inventory_total = 0
+    for item in payload.get('gpu_model_inventory', [])[:64]:
+        if not isinstance(item, dict):
+            continue
+        try:
+            count = max(1, min(128, int(item.get('count', 0))))
+        except:
+            continue
+        raw_name = str(item.get('name', 'NVIDIA GPU'))[:96]
+        name = ''.join(
+            ch for ch in raw_name
+            if ch.isprintable() and ch not in blocked
+        ).strip() or 'NVIDIA GPU'
+        gpu_model_inventory.append({"name": name, "count": count})
+        inventory_total += count
+    if inventory_total:
+        gpu_count = max(gpu_count, min(128, inventory_total))
+
     gpu_health_status = str(payload.get("gpu_health_status", "unknown")).lower()
     if gpu_health_status not in {"pass", "fail", "unknown"}:
         gpu_health_status = "unknown"
@@ -1156,10 +1439,12 @@ def sanitize_discovery_packet(payload, source_ip):
         "primary_mac": macs[0]["mac"] if macs else "-",
         "gpu_count": gpu_count,
         "gpu_summary": gpu_summary,
+        "gpu_model_inventory": gpu_model_inventory,
         "gpu_health_status": gpu_health_status,
         "gpu_expected_count": bounded_count("gpu_expected_count"),
         "gpu_pci_count": bounded_count("gpu_pci_count"),
         "gpu_driver_count": bounded_count("gpu_driver_count"),
+        "gpu_vm_count": bounded_count("gpu_vm_count"),
         "gpu_issue_count": bounded_count("gpu_issue_count"),
         "gpu_missing_count": bounded_count("gpu_missing_count"),
         "_last_seen": time.monotonic(),
@@ -1241,10 +1526,12 @@ def get_node_directory(gpus, gpu_health):
             }
             for index, gpu in enumerate(gpus[:64])
         ],
+        "gpu_model_inventory": get_gpu_model_inventory(gpu_health, gpus),
         "gpu_health_status": gpu_health.get("status", "fail"),
         "gpu_expected_count": gpu_health.get("expected_count", 0),
         "gpu_pci_count": gpu_health.get("pci_count", 0),
         "gpu_driver_count": gpu_health.get("driver_count", 0),
+        "gpu_vm_count": gpu_health.get("vm_count", 0),
         "gpu_issue_count": len(gpu_health.get("issues", [])),
         "gpu_missing_count": gpu_health.get("missing_count", 0),
         "age": 0,
@@ -1450,6 +1737,19 @@ body{
 .node-brand-title{font-size:15px;font-weight:700;letter-spacing:0.6px;color:var(--text)}
 .node-brand-meta{display:flex;align-items:center;justify-content:space-between;margin-top:6px;color:var(--text-secondary);font-size:10px}
 .node-count{color:var(--accent);font-family:'JetBrains Mono',monospace}
+.node-mobile-toggle{display:none;width:100%;align-items:center;gap:10px;padding:9px 10px;color:var(--text);font:inherit;text-align:left;background:linear-gradient(135deg,rgba(14,116,144,.18),rgba(15,23,42,.92));border:1px solid rgba(56,189,248,.24);border-radius:11px;cursor:pointer}
+.node-mobile-icon{display:grid;grid-template-columns:repeat(2,5px);gap:2px;flex:0 0 auto}
+.node-mobile-icon i{width:5px;height:5px;border-radius:1px;background:var(--accent);box-shadow:0 0 7px rgba(56,189,248,.35)}
+.node-mobile-copy{min-width:0;flex:1}
+.node-mobile-title{display:block;font-size:12px;font-weight:650;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.node-mobile-meta{display:block;margin-top:1px;color:var(--text-secondary);font:8px 'JetBrains Mono',monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.node-mobile-badges{display:flex;align-items:center;gap:5px;flex:0 0 auto}
+.node-mobile-count,.node-mobile-fault{padding:3px 6px;border-radius:999px;font:700 8px 'JetBrains Mono',monospace;white-space:nowrap}
+.node-mobile-count{color:var(--accent);background:rgba(56,189,248,.1);border:1px solid rgba(56,189,248,.18)}
+.node-mobile-fault{color:var(--red);background:rgba(127,29,29,.2);border:1px solid rgba(248,113,113,.24)}
+.node-mobile-fault[hidden]{display:none}
+.node-mobile-chevron{color:var(--accent);font:16px 'JetBrains Mono',monospace;transition:transform .2s ease}
+.node-sidebar.mobile-open .node-mobile-chevron{transform:rotate(180deg)}
 .node-list{display:flex;flex-direction:column;gap:8px}
 .node-item{
   width:100%;
@@ -1956,6 +2256,8 @@ tr:last-child td{border-bottom:none}
 .gpu-health-detail th,.gpu-health-detail td{padding:7px 8px;text-align:left;border-top:1px solid rgba(239,68,68,.16);font-size:10px}
 .gpu-health-detail th{color:var(--text-dim);font-size:8px;letter-spacing:1px}
 .gpu-health-code{color:var(--red);font-family:'JetBrains Mono',monospace;white-space:nowrap}
+.gpu-vm-detail th,.gpu-vm-detail td{border-top-color:rgba(56,189,248,.16)}
+.gpu-vm-code{color:var(--accent);font-family:'JetBrains Mono',monospace;white-space:nowrap}
 .gpu-column-head{
   display:grid;
   grid-template-columns:minmax(160px,1.15fr) repeat(4,minmax(0,.725fr)) repeat(4,minmax(0,.6875fr)) minmax(62px,.45fr);
@@ -2010,13 +2312,14 @@ tr:last-child td{border-bottom:none}
 
 @media(max-width:900px){
   .node-sidebar{padding:10px 12px 9px;box-shadow:0 10px 28px rgba(0,0,0,.3)}
-  .node-brand{padding:1px 3px 8px;margin-bottom:8px}
-  .node-brand-title{font-size:14px}
-  .node-list{gap:8px;scrollbar-width:none}
+  .node-brand{display:none}
+  .node-mobile-toggle{display:flex}
+  .node-list{display:none;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;max-height:calc(100vh - 78px);margin-top:8px;padding:2px 1px 6px;overflow-y:auto;overflow-x:hidden;scrollbar-width:thin;scrollbar-color:rgba(56,189,248,.34) transparent}
+  .node-sidebar.mobile-open .node-list{display:grid}
   .node-list::-webkit-scrollbar{display:none}
   .node-brand-meta{flex:0 0 auto}
-  .overview-nav{flex:0 0 190px;min-width:190px;padding:9px 10px}
-  .node-item{min-width:calc((100vw - 32px)/2);padding:9px 10px;border-radius:9px}
+  .overview-nav{grid-column:1/-1;width:100%;min-width:0;padding:9px 10px}
+  .node-item{width:100%;min-width:0;padding:9px 10px;border-radius:9px}
   .node-ip{margin-top:4px}
   .node-detail{margin-top:2px}
   .container{padding:12px}
@@ -2076,6 +2379,10 @@ tr:last-child td{border-bottom:none}
 }
 
 @media(max-width:480px){
+  .node-sidebar{padding:7px 8px}
+  .node-mobile-toggle{padding:8px 9px}
+  .node-mobile-badges{gap:4px}
+  .node-mobile-count,.node-mobile-fault{padding:3px 5px}
   .status-bar{grid-template-columns:repeat(4,minmax(0,1fr))}
   .system-overview .stats-grid{grid-template-columns:repeat(2,minmax(0,1fr))!important}
   .gpu-card>.stats-grid{grid-template-columns:repeat(4,minmax(0,1fr))}
@@ -2089,7 +2396,13 @@ tr:last-child td{border-bottom:none}
 </head>
 <body>
 <div class="app-shell">
-<aside class="node-sidebar" aria-label="局域网节点">
+<aside class="node-sidebar" id="nodeSidebar" aria-label="局域网节点">
+  <button class="node-mobile-toggle" id="nodeMobileToggle" type="button" aria-expanded="false" aria-controls="nodeList">
+    <span class="node-mobile-icon" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+    <span class="node-mobile-copy"><span class="node-mobile-title" id="nodeMobileTitle">机器选择</span><span class="node-mobile-meta" id="nodeMobileMeta">正在发现局域网节点</span></span>
+    <span class="node-mobile-badges"><span class="node-mobile-count" id="nodeMobileCount">0 台</span><span class="node-mobile-fault" id="nodeMobileFault" hidden>0 故障</span></span>
+    <span class="node-mobile-chevron" aria-hidden="true">⌄</span>
+  </button>
   <div class="node-brand">
     <div class="node-brand-title">局域网节点</div>
     <div class="node-brand-meta"><span>自动发现</span><span class="node-count" id="nodeCount">0 台</span></div>
@@ -2151,7 +2464,36 @@ function pickNodeIp(node){
   });
   return best;
 }
-var mainView='node',latestDashboardData=null;
+var mainView='node',latestDashboardData=null,mobileNodeMenuOpen=false;
+function setMobileNodeMenu(open){
+  mobileNodeMenuOpen=!!open&&window.innerWidth<=900;
+  var sidebar=document.getElementById('nodeSidebar');
+  var toggle=document.getElementById('nodeMobileToggle');
+  if(sidebar)sidebar.classList.toggle('mobile-open',mobileNodeMenuOpen);
+  if(toggle)toggle.setAttribute('aria-expanded',mobileNodeMenuOpen?'true':'false');
+}
+function renderMobileNodeSummary(nodes){
+  nodes=Array.isArray(nodes)?nodes:[];
+  var current=nodes.find(function(node){return node.current})||nodes[0]||null;
+  var faultCount=nodes.filter(function(node){return node.gpu_health_status==='fail'}).length;
+  var title=mainView==='overview'?'数据概览':(current?current.hostname:'机器选择');
+  var meta;
+  if(mainView==='overview'){
+    meta=nodes.length+' 台设备在线'+(faultCount?' · '+faultCount+' 台故障':' · 全部正常');
+  }else if(current){
+    var displayIp=current.source_ip||((Array.isArray(current.addresses)&&current.addresses.length)?current.addresses[0]:pickNodeIp(current));
+    var vmCount=Math.max(0,Number(current.gpu_vm_count||0));
+    meta=(displayIp||'无可用地址')+(vmCount?' · VM '+vmCount:'');
+  }else{
+    meta='正在发现局域网节点';
+  }
+  document.getElementById('nodeMobileTitle').textContent=title;
+  document.getElementById('nodeMobileMeta').textContent=meta;
+  document.getElementById('nodeMobileCount').textContent=nodes.length+' 台';
+  var faultBadge=document.getElementById('nodeMobileFault');
+  faultBadge.textContent=faultCount+' 故障';
+  faultBadge.hidden=!faultCount;
+}
 function setMainView(view){
   var nodes=latestDashboardData&&Array.isArray(latestDashboardData.nodes)?latestDashboardData.nodes:[];
   if(view==='overview'&&nodes.length<2)view='node';
@@ -2167,6 +2509,7 @@ function setMainView(view){
       renderStatus(latestDashboardData);
     }
   }
+  setMobileNodeMenu(false);
   window.scrollTo(0,0);
 }
 function formatPower(watts){
@@ -2180,13 +2523,15 @@ function powerMarkup(watts){
 function gpuModelSummary(node){
   var gpus=Array.isArray(node&&node.gpu_summary)?node.gpu_summary:[];
   var declared=Math.max(Number(node&&node.gpu_count||0),gpus.length);
+  var vmCount=Math.max(0,Number(node&&node.gpu_vm_count||0));
   var counts={};
   gpus.forEach(function(gpu){
     var name=String(gpu&&gpu.name||'Unknown GPU');
     counts[name]=(counts[name]||0)+1;
   });
   var parts=Object.keys(counts).sort(function(a,b){return counts[b]-counts[a]||a.localeCompare(b)}).map(function(name){return name+' ×'+counts[name]});
-  var missing=Math.max(0,declared-gpus.length);
+  if(vmCount)parts.push('虚拟机占用 ×'+vmCount);
+  var missing=Math.max(0,declared-gpus.length-vmCount);
   if(missing)parts.push('驱动不可见 ×'+missing);
   if(node&&node.gpu_health_status==='fail'){
     var missingCount=Number(node.gpu_missing_count||0);
@@ -2205,6 +2550,28 @@ function gpuPowerModelSummary(node){
   var parts=Object.keys(counts).sort(function(a,b){return counts[b]-counts[a]||a.localeCompare(b)}).map(function(name){return name+' ×'+counts[name]});
   return parts.length?parts.join(' + '):'暂无功耗数据';
 }
+function gpuInventoryModelCounts(node){
+  var counts={};
+  var inventory=Array.isArray(node&&node.gpu_model_inventory)?node.gpu_model_inventory:[];
+  inventory.forEach(function(item){
+    var name=String(item&&item.name||'').trim();
+    var count=Math.max(0,Number(item&&item.count||0));
+    if(name&&count)counts[name]=(counts[name]||0)+count;
+  });
+  if(Object.keys(counts).length)return counts;
+
+  var gpus=Array.isArray(node&&node.gpu_summary)?node.gpu_summary:[];
+  gpus.forEach(function(gpu){
+    var name=String(gpu&&gpu.name||'NVIDIA GPU');
+    counts[name]=(counts[name]||0)+1;
+  });
+  var declared=Math.max(Number(node&&node.gpu_count||0),gpus.length);
+  var known=gpus.length;
+  var remaining=Math.max(0,declared-known);
+  var names=Object.keys(counts).sort(function(a,b){return counts[b]-counts[a]||a.localeCompare(b)});
+  if(remaining&&names.length)counts[names[0]]+=remaining;
+  return counts;
+}
 function renderOverview(d){
   var nodes=Array.isArray(d.nodes)?d.nodes:[];
   var dashboard=document.getElementById('fleetDashboard');
@@ -2218,21 +2585,23 @@ function renderOverview(d){
     return;
   }
 
-  var totalPower=0,totalGpus=0,modelCounts={},machines=[];
+  var totalPower=0,totalGpus=0,totalMeasuredGpus=0,modelCounts={},machines=[];
   nodes.forEach(function(node){
     var gpus=Array.isArray(node.gpu_summary)?node.gpu_summary:[];
     var count=Math.max(Number(node.gpu_count||0),gpus.length);
     var machinePower=0;
     totalGpus+=count;
+    totalMeasuredGpus+=gpus.length;
     gpus.forEach(function(gpu){
       var power=Math.max(0,Number(gpu.power||0));
       var name=String(gpu.name||'Unknown GPU');
       machinePower+=power;
-      modelCounts[name]=(modelCounts[name]||0)+1;
     });
     totalPower+=machinePower;
-    var missing=Math.max(0,count-gpus.length);
-    if(missing){modelCounts['数据待同步']=(modelCounts['数据待同步']||0)+missing}
+    var inventoryCounts=gpuInventoryModelCounts(node);
+    Object.keys(inventoryCounts).forEach(function(name){
+      modelCounts[name]=(modelCounts[name]||0)+inventoryCounts[name];
+    });
     machines.push({node:node,count:count,power:machinePower,gpuLabel:gpuPowerModelSummary(node)});
   });
 
@@ -2262,13 +2631,13 @@ function renderOverview(d){
     var url=node.current?(location.protocol+'//'+location.host+'/'):('http://'+targetIp+':'+Number(node.port||8889)+'/');
     return '<a class="fleet-fault-row" href="'+esc(url)+'" aria-label="查看故障机器 '+esc(node.hostname)+'">'+inner+'<span class="fleet-fault-go">查看机器 ›</span></a>';
   }).join('');
-  var averagePower=totalGpus?totalPower/totalGpus:0;
+  var averagePower=totalMeasuredGpus?totalPower/totalMeasuredGpus:0;
   dashboard.innerHTML='<div class="header fleet-header"><h1>局域网数据概览</h1><div class="meta"><span>'+nodes.length+' 台设备在线</span>&nbsp;&nbsp;<span>'+esc(d.timestamp)+'</span></div></div>'+
     '<div class="fleet-kpis">'+
       '<div class="fleet-kpi primary"><div class="fleet-kpi-label">GPU 实时总功耗</div><div class="fleet-kpi-value">'+powerMarkup(totalPower)+'</div><div class="fleet-kpi-note">全局每 5 秒自动刷新</div></div>'+
       '<div class="fleet-kpi"><div class="fleet-kpi-label">在线设备</div><div class="fleet-kpi-value">'+nodes.length+'<small>台</small></div><div class="fleet-kpi-note">局域网自动发现</div></div>'+
       '<div class="fleet-kpi"><div class="fleet-kpi-label">显卡总数</div><div class="fleet-kpi-value">'+totalGpus+'<small>张</small></div><div class="fleet-kpi-note">'+models.length+' 种 GPU 型号</div></div>'+
-      '<div class="fleet-kpi"><div class="fleet-kpi-label">单卡平均功耗</div><div class="fleet-kpi-value">'+powerMarkup(averagePower)+'</div><div class="fleet-kpi-note">按当前实时功耗计算</div></div>'+
+      '<div class="fleet-kpi"><div class="fleet-kpi-label">单卡平均功耗</div><div class="fleet-kpi-value">'+powerMarkup(averagePower)+'</div><div class="fleet-kpi-note">按宿主机可见 '+totalMeasuredGpus+' 张计算</div></div>'+ 
       '<button class="fleet-kpi fault-link '+(faultMachines.length?'has-faults':'no-faults')+'" type="button" data-fault-target="fleetFaultPanel"><div class="fleet-kpi-label">故障机器</div><div class="fleet-kpi-value">'+faultMachines.length+'<small>台</small></div><div class="fleet-kpi-note">'+(faultMachines.length?'点击查看并跳转':'当前未发现故障')+'</div></button>'+
     '</div>'+
     '<div class="fleet-panels"><section class="fleet-panel"><div class="fleet-panel-head"><span class="fleet-panel-title">显卡型号分布</span><span class="fleet-panel-meta">'+totalGpus+' 张</span></div><div class="fleet-model-list">'+(modelHtml||'<div class="fleet-empty">暂无显卡数据</div>')+'</div></section>'+
@@ -2282,6 +2651,7 @@ function renderOverview(d){
 function renderNodes(d){
   var nodes=Array.isArray(d.nodes)?d.nodes:[];
   document.getElementById('nodeCount').textContent=nodes.length+' 台';
+  renderMobileNodeSummary(nodes);
   if(!nodes.length){
     document.getElementById('nodeList').innerHTML='<div class="node-empty">暂未发现节点</div>';
     return;
@@ -2317,13 +2687,16 @@ function renderStatus(d){
   var health=d.gpu_health||{};
   var expected=Number(health.expected_count||d.gpus.length||0);
   var driverCount=Number(health.driver_count||d.gpus.length||0);
-  if(d.has_gpu){title+=' · '+d.gpus[0].name+' x'+driverCount}
+  var vmCount=Math.max(0,Number(health.vm_count||0));
+  var accounted=expected?Math.min(expected,driverCount+vmCount):driverCount+vmCount;
+  if(d.has_gpu){title+=' · '+d.gpus[0].name+' x'+driverCount+(vmCount?' · VM x'+vmCount:'')}
   document.getElementById('pageTitle').textContent=title;
   document.title=mainView==='overview'?'局域网数据概览 · '+(Array.isArray(d.nodes)?d.nodes.length:0)+' 台设备':title;
   var html='<div class="status-item"><div class="label">主机名</div><div class="value">'+d.hostname+'</div></div>'+
     '<div class="status-item"><div class="label">运行时间</div><div class="value">'+d.uptime+'</div></div>';
   var totalPower=0;d.gpus.forEach(function(g){totalPower+=g.power});
-  var healthText=health.status==='pass'?'健康检查通过 '+driverCount+'/'+expected:'显卡健康异常 '+driverCount+'/'+expected;
+  var healthText=health.status==='pass'?'健康检查通过 '+accounted+'/'+expected:'显卡健康异常 '+accounted+'/'+expected;
+  if(vmCount)healthText+=' · 宿主机 '+driverCount+' · VM '+vmCount;
   var healthColor=health.status==='pass'?'var(--green)':'var(--red)';
   html+='<div class="status-item"><div class="label">GPU健康</div><div class="value" style="color:'+healthColor+'">'+esc(healthText)+'</div></div>';
   html+='<div class="status-item"><div class="label">GPU总功耗</div><div class="value">'+totalPower.toFixed(1)+' W</div></div>';
@@ -2380,15 +2753,23 @@ function renderGPUs(d){
 function renderGPUHealth(d){
   var health=d.gpu_health||{status:'fail',expected_count:0,pci_count:0,driver_count:0,issues:[]};
   var issues=Array.isArray(health.issues)?health.issues:[];
+  var vmGpus=Array.isArray(health.vm_gpus)?health.vm_gpus:[];
   var passed=health.status==='pass';
+  var vmCount=Math.max(Number(health.vm_count||0),vmGpus.length);
+  var accounted=health.expected_count?Math.min(Number(health.expected_count),Number(health.driver_count||0)+vmCount):Number(health.driver_count||0)+vmCount;
   var meta=document.getElementById('gpuSectionMeta');
   meta.className='gpu-section-meta '+(passed?'health-pass':'health-fail');
-  meta.textContent=passed?'健康检查通过 '+health.driver_count+'/'+health.expected_count+' · 5 秒刷新':'显卡健康异常 '+health.driver_count+'/'+health.expected_count+' · 5 秒刷新';
-  var summary=(passed?'检查通过':'检查失败')+' · 基线 '+health.expected_count+' 张 · PCIe '+health.pci_count+' 张 · 驱动 '+health.driver_count+' 张';
+  meta.textContent=(passed?'健康检查通过 ':'显卡健康异常 ')+accounted+'/'+health.expected_count+(vmCount?' · VM '+vmCount:'')+' · 5 秒刷新';
+  var summary=(passed?'检查通过':'检查失败')+' · 基线 '+health.expected_count+' 张 · PCIe '+health.pci_count+' 张 · 宿主机驱动 '+health.driver_count+' 张 · VM '+vmCount+' 张';
   var html='<div class="gpu-health '+(passed?'pass':'fail')+'"><div class="gpu-health-summary"><strong>'+(passed?'正常':'异常')+'</strong><span>'+esc(summary)+'</span></div>';
   if(!passed&&issues.length){
     html+='<table class="gpu-health-detail"><thead><tr><th>状态</th><th>显卡型号</th><th>BusID</th><th>物理插槽</th><th>异常原因</th></tr></thead><tbody>';
     html+=issues.map(function(issue){return '<tr><td class="gpu-health-code">异常</td><td>'+esc(issue.model)+'</td><td>'+esc(issue.bus_id)+'</td><td>'+esc(issue.slot)+'</td><td>'+esc(issue.message)+'</td></tr>'}).join('');
+    html+='</tbody></table>';
+  }
+  if(vmGpus.length){
+    html+='<table class="gpu-health-detail gpu-vm-detail"><thead><tr><th>状态</th><th>显卡型号</th><th>BusID</th><th>物理插槽</th><th>虚拟机</th></tr></thead><tbody>';
+    html+=vmGpus.map(function(gpu){return '<tr><td class="gpu-vm-code">VM 占用</td><td>'+esc(gpu.model)+'</td><td>'+esc(gpu.bus_id)+'</td><td>'+esc(gpu.slot)+'</td><td>'+esc(gpu.vm_name||'QEMU VM')+'</td></tr>'}).join('');
     html+='</tbody></table>';
   }
   document.getElementById('gpuHealthSection').innerHTML=html+'</div>';
@@ -2422,7 +2803,20 @@ async function refresh(){
 }
 document.getElementById('nodeList').addEventListener('click',function(event){
   var button=event.target.closest('[data-main-view]');
-  if(button)setMainView(button.getAttribute('data-main-view'));
+  if(button){setMainView(button.getAttribute('data-main-view'));return}
+  if(event.target.closest('.node-item'))setMobileNodeMenu(false);
+});
+document.getElementById('nodeMobileToggle').addEventListener('click',function(){
+  setMobileNodeMenu(!mobileNodeMenuOpen);
+});
+document.querySelector('.dashboard-main').addEventListener('click',function(){
+  if(mobileNodeMenuOpen)setMobileNodeMenu(false);
+});
+document.addEventListener('keydown',function(event){
+  if(event.key==='Escape'&&mobileNodeMenuOpen)setMobileNodeMenu(false);
+});
+window.addEventListener('resize',function(){
+  if(window.innerWidth>900&&mobileNodeMenuOpen)setMobileNodeMenu(false);
 });
 document.getElementById('fleetDashboard').addEventListener('click',function(event){
   var button=event.target.closest('[data-fault-target]');
@@ -2690,7 +3084,8 @@ if not isinstance(health, dict) or health.get("status") not in {"pass", "fail"}:
 print(
     "  [OK] gpu-health   - "
     f"{health['status'].upper()} expected={health.get('expected_count', 0)} "
-    f"pci={health.get('pci_count', 0)} driver={health.get('driver_count', 0)}"
+    f"pci={health.get('pci_count', 0)} driver={health.get('driver_count', 0)} "
+    f"vm={health.get('vm_count', 0)}"
 )
 PY_CHECK
 LAN_IP=$(ip -4 route get 1.0.0.0 2>/dev/null | grep -oP 'src \K[\d.]+' | head -1)
