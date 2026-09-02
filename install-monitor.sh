@@ -469,7 +469,9 @@ def evaluate_health(
     driver,
     vm_assignments=None,
 ):
-    expected = baseline.get("gpus", []) if baseline else []
+    # Health is intentionally real-time: the current PCIe inventory is the
+    # expected set. Historical baselines are accepted for CLI compatibility,
+    # but never participate in status evaluation.
     physical_map = {normalize_bus_id(gpu["bus_id"]): gpu for gpu in physical}
     driver_map = {normalize_bus_id(gpu["bus_id"]): gpu for gpu in driver}
     vm_assignments = {
@@ -506,28 +508,16 @@ def evaluate_health(
     vm_gpus.sort(key=lambda item: item["bus_id"])
     vm_bus_ids = {item["bus_id"] for item in vm_gpus}
 
-    if baseline_error:
-        issues.append(make_issue(baseline_error))
-    expected_buses = {normalize_bus_id(gpu["bus_id"]) for gpu in expected}
-    non_vm_expected_on_pci = {
-        bus_id for bus_id in expected_buses
-        if bus_id in physical_map and bus_id not in vm_bus_ids
-    }
-    if not driver_available and (non_vm_expected_on_pci or not expected):
+    non_vm_pci_buses = set(physical_map) - vm_bus_ids
+    if not driver_available and non_vm_pci_buses:
         issues.append(make_issue("DRIVER_UNAVAILABLE"))
 
     missing_buses = set()
-    for gpu in expected:
-        bus_id = normalize_bus_id(gpu["bus_id"])
-        current = physical_map.get(bus_id)
-        if current is None:
-            issues.append(make_issue("PCI_MISSING", gpu))
-            missing_buses.add(bus_id)
-        elif bus_id in vm_bus_ids:
+    for bus_id, current in physical_map.items():
+        if bus_id in vm_bus_ids:
             continue
-        elif driver_available and bus_id not in driver_map:
-            merged = dict(gpu)
-            merged.update(current)
+        if driver_available and bus_id not in driver_map:
+            merged = dict(current)
             if merged.get("model") in model_aliases:
                 merged["model"] = model_aliases[merged["model"]]
             issues.append(make_issue("DRIVER_MISSING", merged))
@@ -535,14 +525,9 @@ def evaluate_health(
         elif not driver_available:
             missing_buses.add(bus_id)
 
-    if baseline:
-        for bus_id, gpu in physical_map.items():
-            if bus_id not in expected_buses:
-                issues.append(make_issue("TOPOLOGY_CHANGED", gpu))
-
     return {
         "status": "pass" if not issues else "fail",
-        "expected_count": len(expected),
+        "expected_count": len(physical),
         "pci_count": len(physical),
         "driver_count": len(driver) if driver_available else 0,
         "vm_count": len(vm_gpus),
@@ -557,13 +542,12 @@ def evaluate_health(
 
 
 def collect_health(baseline_path=DEFAULT_BASELINE):
-    baseline, baseline_error = load_baseline(baseline_path)
     physical = collect_physical_gpus()
     driver_available, driver, _ = collect_driver_gpus()
     vm_assignments = collect_vm_passthrough_gpus()
     return evaluate_health(
-        baseline,
-        baseline_error,
+        None,
+        "",
         physical,
         driver_available,
         driver,
@@ -644,8 +628,8 @@ def format_tty(health):
 
     summary = (
         f"  GPU HEALTH: {health['status'].upper()}  "
-        f"EXPECTED={health['expected_count']}  PCI={health['pci_count']}  "
-        f"DRIVER={health['driver_count']}  VM={health.get('vm_count', 0)}"
+        f"PCI={health['pci_count']}  DRIVER={health['driver_count']}  "
+        f"VM={health.get('vm_count', 0)}"
     )
     if health["issues"]:
         lines.extend([
@@ -750,10 +734,12 @@ System Slot Information
     assert all_vm["missing_count"] == 0
 
     pci_missing = evaluate_health(expected, "", current[1:], True, driver)
-    assert pci_missing["issues"][0]["code"] == "PCI_MISSING"
+    assert pci_missing["status"] == "pass"
+    assert pci_missing["expected_count"] == 1 and not pci_missing["issues"]
     pci_all_missing = evaluate_health(expected, "", [], True, [])
-    assert [item["code"] for item in pci_all_missing["issues"]] == ["PCI_MISSING", "PCI_MISSING"]
-    assert pci_all_missing["missing_count"] == 2
+    assert pci_all_missing["status"] == "pass"
+    assert pci_all_missing["expected_count"] == 0 and not pci_all_missing["issues"]
+    assert pci_all_missing["missing_count"] == 0
     all_driver = [
         {"bus_id": item["bus_id"], "index": i, "name": item["model"], "power": "20", "temp": "35"}
         for i, item in enumerate(expected["gpus"])
@@ -767,11 +753,11 @@ System Slot Information
     assert unavailable["missing_count"] == 2
     extra = {"model": "RTX 4090", "bus_id": "0000:06:00.0", "slot": "CPU1 SLOT10"}
     topology = evaluate_health(expected, "", current + [extra], True, all_driver + [extra])
-    assert [item["code"] for item in topology["issues"]] == ["TOPOLOGY_CHANGED"]
-    assert topology["missing_count"] == 0
+    assert topology["status"] == "pass" and not topology["issues"]
+    assert topology["expected_count"] == 3 and topology["missing_count"] == 0
     no_baseline = evaluate_health(None, "BASELINE_MISSING", current, True, all_driver)
-    assert [item["code"] for item in no_baseline["issues"]] == ["BASELINE_MISSING"]
-    assert no_baseline["expected_count"] == 0
+    assert no_baseline["status"] == "pass" and not no_baseline["issues"]
+    assert no_baseline["expected_count"] == 2
     print("gpu-health self-test: PASS")
     return 0
 
@@ -2760,7 +2746,7 @@ function renderGPUHealth(d){
   var meta=document.getElementById('gpuSectionMeta');
   meta.className='gpu-section-meta '+(passed?'health-pass':'health-fail');
   meta.textContent=(passed?'健康检查通过 ':'显卡健康异常 ')+accounted+'/'+health.expected_count+(vmCount?' · VM '+vmCount:'')+' · 5 秒刷新';
-  var summary=(passed?'检查通过':'检查失败')+' · 基线 '+health.expected_count+' 张 · PCIe '+health.pci_count+' 张 · 宿主机驱动 '+health.driver_count+' 张 · VM '+vmCount+' 张';
+  var summary=(passed?'检查通过':'检查失败')+' · 当前 PCIe '+health.pci_count+' 张 · 宿主机驱动 '+health.driver_count+' 张 · VM '+vmCount+' 张';
   var html='<div class="gpu-health '+(passed?'pass':'fail')+'"><div class="gpu-health-summary"><strong>'+(passed?'正常':'异常')+'</strong><span>'+esc(summary)+'</span></div>';
   if(!passed&&issues.length){
     html+='<table class="gpu-health-detail"><thead><tr><th>状态</th><th>显卡型号</th><th>BusID</th><th>物理插槽</th><th>异常原因</th></tr></thead><tbody>';
@@ -2927,6 +2913,11 @@ collect_info() {
   UPTIME_M=$(( (UPTIME_SEC % 3600) / 60 ))
   UPTIME_S=$((UPTIME_SEC % 60 ))
   UPTIME_STR="${UPTIME_D}d ${UPTIME_H}h ${UPTIME_M}m ${UPTIME_S}s"
+
+  BAIDU_STATUS="NO"
+  if command -v ping >/dev/null 2>&1 && timeout 3 ping -c 1 -W 1 www.baidu.com >/dev/null 2>&1; then
+    BAIDU_STATUS="YES"
+  fi
 }
 
 show_info() {
@@ -2934,6 +2925,7 @@ show_info() {
   echo ""
   MACHINE_ID=$(awk 'NR==1{print $NF}' /opt/frp/machine_id.txt 2>/dev/null || echo "")
   echo "  Hostname: ${HOSTNAME}  ServerID: ${MACHINE_ID}  Uptime: ${UPTIME_STR}"
+  echo "  www.baidu.com: ${BAIDU_STATUS}"
   echo ""
   echo "  CPU:    ${CPU_CORES} cores"
   echo "  RAM:    ${MEM_GB} GB"
@@ -3005,7 +2997,6 @@ mv -f ${STAGE_DIR}/server.py ${INSTALL_DIR}/server.py
 mv -f ${STAGE_DIR}/tty-banner.sh ${INSTALL_DIR}/tty-banner.sh
 ln -sfn gpu_health.py ${INSTALL_DIR}/gpu-health.py
 DEPLOYED=1
-${PYTHON_BIN} ${INSTALL_DIR}/gpu-health.py --ensure-baseline
 
 echo "[*] Create hw-monitor service..."
 cat > /etc/systemd/system/${SERVICE1}.service << EOF
@@ -3083,12 +3074,11 @@ if not isinstance(health, dict) or health.get("status") not in {"pass", "fail"}:
     raise SystemExit("gpu_health is missing from /api/data")
 print(
     "  [OK] gpu-health   - "
-    f"{health['status'].upper()} expected={health.get('expected_count', 0)} "
-    f"pci={health.get('pci_count', 0)} driver={health.get('driver_count', 0)} "
+    f"{health['status'].upper()} pci={health.get('pci_count', 0)} "
+    f"driver={health.get('driver_count', 0)} "
     f"vm={health.get('vm_count', 0)}"
 )
 PY_CHECK
 LAN_IP=$(ip -4 route get 1.0.0.0 2>/dev/null | grep -oP 'src \K[\d.]+' | head -1)
 [ -n "$LAN_IP" ] && echo "  URL: http://${LAN_IP}:${PORT}"
-echo "  Baseline refresh: sudo ${INSTALL_DIR}/gpu-health.py --refresh-baseline"
 echo "============================================"
