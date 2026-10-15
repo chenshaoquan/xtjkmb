@@ -49,7 +49,7 @@ mkdir -p ${INSTALL_DIR}
 STAGE_DIR=$(mktemp -d "${INSTALL_DIR}/.install-stage.XXXXXX")
 ROLLBACK_DIR=$(mktemp -d "/tmp/hw-monitor-rollback.XXXXXX")
 DEPLOYED=0
-for APP_FILE in server.py tty-banner.sh gpu_health.py gpu-health.py; do
+for APP_FILE in server.py tty-banner.sh gpu_health.py gpu-health.py cpu_temperature.py; do
   [ -e "${INSTALL_DIR}/${APP_FILE}" ] && cp -a "${INSTALL_DIR}/${APP_FILE}" "${ROLLBACK_DIR}/${APP_FILE}"
 done
 
@@ -58,7 +58,7 @@ cleanup_install() {
   if [ "$RESULT" -ne 0 ]; then
     echo "[ERROR] Installation failed; restoring the previous monitor files."
     if [ "$DEPLOYED" = "1" ]; then
-      for APP_FILE in server.py tty-banner.sh gpu_health.py gpu-health.py; do
+      for APP_FILE in server.py tty-banner.sh gpu_health.py gpu-health.py cpu_temperature.py; do
         if [ -e "${ROLLBACK_DIR}/${APP_FILE}" ]; then
           rm -f "${INSTALL_DIR}/${APP_FILE}"
           cp -a "${ROLLBACK_DIR}/${APP_FILE}" "${INSTALL_DIR}/${APP_FILE}"
@@ -801,6 +801,75 @@ if __name__ == "__main__":
 GPU_HEALTH_EOF
 chmod 0755 ${STAGE_DIR}/gpu_health.py
 
+echo "[*] Deploy shared CPU temperature collector..."
+cat > ${STAGE_DIR}/cpu_temperature.py << 'CPU_TEMPERATURE_EOF'
+#!/usr/bin/env python3
+"""Read one package temperature per supported CPU hwmon device for Web and TTY."""
+
+import argparse
+import json
+from pathlib import Path
+
+
+def temperature_status(value):
+    if value is None:
+        return "unavailable"
+    if value > 88:
+        return "critical"
+    if value >= 80:
+        return "warning"
+    return "normal"
+
+
+def collect_cpu_temperatures(hwmon_root="/sys/class/hwmon"):
+    sensors = []
+    try:
+        devices = sorted(
+            (p for p in Path(hwmon_root).glob("hwmon*") if p.name[5:].isdigit()),
+            key=lambda p: int(p.name[5:]),
+        )
+    except OSError:
+        return sensors
+    for device in devices:
+        try:
+            driver = (device / "name").read_text().strip()
+        except OSError:
+            continue
+        if driver not in {"coretemp", "k10temp", "zenpower"}:
+            continue
+        try:
+            value = round(int((device / "temp1_input").read_text().strip()) / 1000, 1)
+        except (OSError, ValueError):
+            value = None
+        sensors.append({
+            "name": f"CPU{len(sensors) + 1}",
+            "sensor": driver,
+            "temperature_c": value,
+            "status": temperature_status(value),
+        })
+    return sensors
+
+
+def format_tty(sensors):
+    if not sensors:
+        return "    No CPU temperature sensor found"
+    return "\n".join(
+        f"    {item['name']}: " + (
+            f"{item['temperature_c']:.1f} C"
+            if item["temperature_c"] is not None else "N/A"
+        )
+        for item in sensors
+    )
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--tty", action="store_true")
+    args = parser.parse_args()
+    temperatures = collect_cpu_temperatures()
+    print(format_tty(temperatures) if args.tty else json.dumps(temperatures))
+CPU_TEMPERATURE_EOF
+
 echo "[*] Deploy web monitor..."
 cat > ${STAGE_DIR}/server.py << 'SERVER_EOF'
 #!/usr/bin/env python3
@@ -808,6 +877,7 @@ cat > ${STAGE_DIR}/server.py << 'SERVER_EOF'
 
 import http.server
 import json
+import math
 import subprocess
 import re
 import os
@@ -821,6 +891,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 
 from gpu_health import collect_health, normalize_bus_id
+from cpu_temperature import collect_cpu_temperatures, temperature_status
 
 PORT = 8889
 DISCOVERY_PORT = 8890
@@ -871,7 +942,8 @@ def get_uptime():
         return "N/A"
 
 def get_cpu_info():
-    info = {"model": "N/A", "cores": 0, "threads": 0, "usage": 0.0, "freq": "N/A"}
+    info = {"model": "N/A", "cores": 0, "threads": 0, "usage": 0.0, "freq": "N/A",
+            "temperatures": collect_cpu_temperatures()}
     try:
         with open('/proc/cpuinfo', 'r') as f:
             cpuinfo = f.read()
@@ -1322,9 +1394,31 @@ def build_discovery_announcement():
         "gpu_vm_count": gpu_health.get("vm_count", 0),
         "gpu_issue_count": len(gpu_health.get("issues", [])),
         "gpu_missing_count": gpu_health.get("missing_count", 0),
+        "cpu_temperatures": collect_cpu_temperatures(),
         "timestamp": int(time.time()),
     }
     return json.dumps(payload, ensure_ascii=False, separators=(',', ':')).encode('utf-8'), broadcasts
+
+def sanitize_cpu_temperatures(readings):
+    if not isinstance(readings, list):
+        return []
+    result = []
+    seen = set()
+    for index, item in enumerate(readings[:64]):
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", f"CPU{index + 1}"))
+        if not re.fullmatch(r"CPU[1-9][0-9]{0,2}", name) or name in seen:
+            continue
+        value = item.get("temperature_c")
+        if type(value) not in (int, float) or not math.isfinite(value) or not -100 <= value <= 200:
+            value = None
+        else:
+            value = round(value, 1)
+        result.append({"name": name, "temperature_c": value, "status": temperature_status(value)})
+        seen.add(name)
+    return result
+
 
 def sanitize_discovery_packet(payload, source_ip):
     if payload.get('protocol') != DISCOVERY_PROTOCOL or payload.get('version') != DISCOVERY_VERSION:
@@ -1433,6 +1527,7 @@ def sanitize_discovery_packet(payload, source_ip):
         "gpu_vm_count": bounded_count("gpu_vm_count"),
         "gpu_issue_count": bounded_count("gpu_issue_count"),
         "gpu_missing_count": bounded_count("gpu_missing_count"),
+        "cpu_temperatures": sanitize_cpu_temperatures(payload.get("cpu_temperatures")),
         "_last_seen": time.monotonic(),
     }
 
@@ -1489,7 +1584,7 @@ def discovery_loop():
                 except:
                     pass
 
-def get_node_directory(gpus, gpu_health):
+def get_node_directory(gpus, gpu_health, cpu_temperatures=None):
     addresses, _, macs = get_discovery_network()
     physical_ip = next(
         (item["ip"] for item in addresses if item.get("physical")), ""
@@ -1520,6 +1615,7 @@ def get_node_directory(gpus, gpu_health):
         "gpu_vm_count": gpu_health.get("vm_count", 0),
         "gpu_issue_count": len(gpu_health.get("issues", [])),
         "gpu_missing_count": gpu_health.get("missing_count", 0),
+        "cpu_temperatures": collect_cpu_temperatures() if cpu_temperatures is None else cpu_temperatures,
         "age": 0,
         "current": True,
     }
@@ -1660,7 +1756,7 @@ def collect_all():
         "gpu_health": gpu_health,
         "burn_status": {str(k): v for k, v in burn_status.items()},
         "network": [{"name": n["name"], "rx": fmt_bytes(n["rx"]), "tx": fmt_bytes(n["tx"]), "ip": n["ip"], "speed": n["speed"], "mac": n["mac"]} for n in net],
-        "nodes": get_node_directory(gpus, gpu_health),
+        "nodes": get_node_directory(gpus, gpu_health, cpu["temperatures"]),
     }
 
 HTML_PAGE = '''<!DOCTYPE html>
@@ -1776,16 +1872,23 @@ body{
 .overview-nav-arrow{color:var(--accent);font:14px 'JetBrains Mono',monospace}
 .node-dashboard[hidden],.fleet-dashboard[hidden]{display:none!important}
 .fleet-header{margin-bottom:24px}
-.fleet-kpis{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px;margin-bottom:16px}
+.fleet-kpis{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:12px;margin-bottom:16px}
 .fleet-kpi{position:relative;overflow:hidden;min-height:116px;padding:20px;background:var(--card);border:1px solid var(--border);border-radius:14px;box-shadow:0 4px 24px rgba(0,0,0,.28)}
 .fleet-kpi::after{content:'';position:absolute;inset:auto -24px -34px auto;width:90px;height:90px;border-radius:50%;background:rgba(56,189,248,.055)}
 .fleet-kpi.primary{background:linear-gradient(145deg,rgba(14,116,144,.22),rgba(15,23,42,.94));border-color:rgba(56,189,248,.24)}
-.fleet-kpi.fault-link{width:100%;color:inherit;font:inherit;text-align:left;cursor:pointer;transition:transform .2s ease,border-color .2s ease,background .2s ease}
+.fleet-kpi.fault-link,.fleet-kpi.cpu-heat-link{width:100%;color:inherit;font:inherit;text-align:left;cursor:pointer;transition:transform .2s ease,border-color .2s ease,background .2s ease}
 .fleet-kpi.fault-link:hover{transform:translateY(-2px);border-color:rgba(248,113,113,.45);background:var(--card-hover)}
-.fleet-kpi.fault-link:focus-visible,.fleet-fault-row:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.fleet-kpi.fault-link:focus-visible,.fleet-kpi.cpu-heat-link:focus-visible,.fleet-fault-row:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .fleet-kpi.fault-link.has-faults{background:linear-gradient(145deg,rgba(127,29,29,.2),rgba(15,23,42,.94));border-color:rgba(248,113,113,.3)}
 .fleet-kpi.fault-link.has-faults .fleet-kpi-value{color:var(--red)}
 .fleet-kpi.fault-link.no-faults .fleet-kpi-value{color:var(--green)}
+.fleet-kpi.cpu-heat-link:hover{transform:translateY(-2px);border-color:#fb923c;background:var(--card-hover)}
+.fleet-kpi.cpu-heat-link.normal .fleet-kpi-value{color:var(--green)}
+.fleet-kpi.cpu-heat-link.unavailable .fleet-kpi-value{color:var(--text-secondary)}
+.fleet-kpi.cpu-heat-link.warning{background:linear-gradient(145deg,rgba(154,52,18,.2),rgba(15,23,42,.94));border-color:rgba(251,146,60,.4)}
+.fleet-kpi.cpu-heat-link.warning .fleet-kpi-value{color:#fb923c}
+.fleet-kpi.cpu-heat-link.critical{background:linear-gradient(145deg,rgba(127,29,29,.2),rgba(15,23,42,.94));border-color:rgba(248,113,113,.4)}
+.fleet-kpi.cpu-heat-link.critical .fleet-kpi-value{color:var(--red);animation:cpu-temp-blink 1.4s ease-in-out infinite}
 .fleet-kpi-label{color:var(--text-dim);font-size:9px;letter-spacing:1.4px}
 .fleet-kpi-value{margin-top:9px;color:var(--text);font:700 27px 'JetBrains Mono',monospace;letter-spacing:-1px}
 .fleet-kpi-value small{margin-left:5px;color:var(--accent);font:600 11px 'Outfit','Microsoft YaHei',sans-serif;letter-spacing:0}
@@ -1820,6 +1923,13 @@ body{
 .fleet-fault-name .node-dot{background:var(--red);box-shadow:0 0 10px rgba(248,113,113,.55)}
 .fleet-fault-detail{margin-top:4px;color:var(--text-secondary);font:9px 'JetBrains Mono',monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .fleet-fault-go{color:var(--red);font:600 10px 'JetBrains Mono',monospace;white-space:nowrap}
+.fleet-cpu-row.warning{background:rgba(154,52,18,.10);border-color:rgba(251,146,60,.3)}
+.fleet-cpu-row.warning:hover{background:rgba(154,52,18,.18)}
+.fleet-cpu-row.warning .node-dot{background:#fb923c;box-shadow:0 0 10px rgba(251,146,60,.4)}
+.fleet-cpu-row.warning .fleet-fault-go{color:#fb923c}
+.fleet-cpu-sensors{display:flex;flex-wrap:wrap;gap:6px 14px;margin-top:7px;font:600 12px 'JetBrains Mono',monospace}
+.fleet-cpu-coverage{margin-top:10px;color:var(--text-secondary);font-size:10px}
+@media(min-width:901px) and (max-width:1200px){.fleet-kpis{grid-template-columns:repeat(3,minmax(0,1fr))}}
 .dashboard-main{min-width:0;margin-left:232px}
 .container{max-width:1800px;margin:0 auto;padding:28px 32px}
 .header{display:flex;justify-content:space-between;align-items:center;padding:24px 0;border-bottom:1px solid var(--border);margin-bottom:32px;position:relative}
@@ -2216,6 +2326,16 @@ tr:last-child td{border-bottom:none}
 .system-overview .stat-box{padding:10px 8px}
 .system-overview .stat-box .stat-label{margin-bottom:6px}
 .system-overview .stat-box .stat-value{font-size:16px!important}
+.cpu-temperatures{margin-top:12px;padding-top:10px;border-top:1px solid var(--border)}
+.cpu-temperatures-title{margin-bottom:8px;color:var(--text-secondary);font-size:11px}
+.cpu-temperature-row{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:5px 0;font:12px 'JetBrains Mono',monospace}
+.cpu-temperature-value{font-weight:700;white-space:nowrap}
+.cpu-temp-normal{color:var(--green)}
+.cpu-temp-warning{color:#fb923c}
+.cpu-temp-critical{color:var(--red);animation:cpu-temp-blink 1.4s ease-in-out infinite}
+.cpu-temp-unavailable,.cpu-temperature-empty{color:var(--text-secondary);font-size:11px}
+@keyframes cpu-temp-blink{0%,100%{opacity:1}50%{opacity:.35}}
+@media(prefers-reduced-motion:reduce){.cpu-temp-critical{animation:none}}
 .system-overview th{padding:8px 7px;font-size:8px;letter-spacing:1px}
 .system-overview td{padding:9px 7px;font-size:10px;white-space:nowrap}
 .system-overview table{table-layout:fixed}
@@ -2558,6 +2678,13 @@ function gpuInventoryModelCounts(node){
   if(remaining&&names.length)counts[names[0]]+=remaining;
   return counts;
 }
+function cpuFleetHealth(node){
+  var readings=Array.isArray(node.cpu_temperatures)?node.cpu_temperatures:[];
+  readings=readings.filter(function(sensor){return sensor&&typeof sensor.temperature_c==='number'&&Number.isFinite(sensor.temperature_c)&&sensor.temperature_c>=-100&&sensor.temperature_c<=200});
+  var hot=readings.filter(function(sensor){return sensor.temperature_c>=80});
+  var max=readings.length?Math.max.apply(null,readings.map(function(sensor){return sensor.temperature_c})):null;
+  return {readings:readings,hot:hot,max:max,critical:max!==null&&max>88};
+}
 function renderOverview(d){
   var nodes=Array.isArray(d.nodes)?d.nodes:[];
   var dashboard=document.getElementById('fleetDashboard');
@@ -2618,6 +2745,23 @@ function renderOverview(d){
     return '<a class="fleet-fault-row" href="'+esc(url)+'" aria-label="查看故障机器 '+esc(node.hostname)+'">'+inner+'<span class="fleet-fault-go">查看机器 ›</span></a>';
   }).join('');
   var averagePower=totalMeasuredGpus?totalPower/totalMeasuredGpus:0;
+  var cpuMachines=machines.map(function(machine){return {node:machine.node,heat:cpuFleetHealth(machine.node)}});
+  var cpuMonitored=cpuMachines.filter(function(machine){return machine.heat.readings.length>0}).length;
+  var hotCpuMachines=cpuMachines.filter(function(machine){return machine.heat.hot.length>0}).sort(function(a,b){return b.heat.max-a.heat.max});
+  var cpuState=hotCpuMachines.some(function(machine){return machine.heat.critical})?'critical':hotCpuMachines.length?'warning':cpuMonitored?'normal':'unavailable';
+  var cpuCoverage=cpuMonitored+'/'+nodes.length+' 台已上报温度';
+  var cpuHeatHtml=hotCpuMachines.map(function(machine){
+    var node=machine.node,heat=machine.heat;
+    var targetIp=node.current?location.hostname:pickNodeIp(node);
+    var displayIp=node.source_ip||((Array.isArray(node.addresses)&&node.addresses.length)?node.addresses[0]:targetIp);
+    var sensors=heat.hot.map(function(sensor){return '<span class="'+cpuTempClass(sensor.temperature_c)+'">'+esc(sensor.name)+' '+sensor.temperature_c.toFixed(1)+'\u00b0C</span>'}).join('');
+    var severity=heat.critical?'critical':'warning';
+    var inner='<span class="fleet-fault-main"><span class="fleet-fault-name"><span class="node-dot"></span>'+esc(node.hostname)+'</span><span class="fleet-fault-detail">'+esc(displayIp||'无可用地址')+' · '+(heat.critical?'CPU 高温':'CPU 温度偏高')+'</span><span class="fleet-cpu-sensors">'+sensors+'</span></span>';
+    if(!targetIp)return '<div class="fleet-fault-row fleet-cpu-row '+severity+'">'+inner+'<span class="fleet-fault-go">地址不可用</span></div>';
+    var url=node.current?(location.protocol+'//'+location.host+'/'):('http://'+targetIp+':'+Number(node.port||8889)+'/');
+    return '<a class="fleet-fault-row fleet-cpu-row '+severity+'" href="'+esc(url)+'" aria-label="查看 CPU 高温机器 '+esc(node.hostname)+'">'+inner+'<span class="fleet-fault-go">查看机器 ›</span></a>';
+  }).join('');
+  var cpuEmpty=cpuMonitored?'已上报温度的设备中暂无 CPU 高温':'暂无 CPU 温度数据';
   dashboard.innerHTML='<div class="header fleet-header"><h1>局域网数据概览</h1><div class="meta"><span>'+nodes.length+' 台设备在线</span>&nbsp;&nbsp;<span>'+esc(d.timestamp)+'</span></div></div>'+
     '<div class="fleet-kpis">'+
       '<div class="fleet-kpi primary"><div class="fleet-kpi-label">GPU 实时总功耗</div><div class="fleet-kpi-value">'+powerMarkup(totalPower)+'</div><div class="fleet-kpi-note">全局每 5 秒自动刷新</div></div>'+
@@ -2625,10 +2769,12 @@ function renderOverview(d){
       '<div class="fleet-kpi"><div class="fleet-kpi-label">显卡总数</div><div class="fleet-kpi-value">'+totalGpus+'<small>张</small></div><div class="fleet-kpi-note">'+models.length+' 种 GPU 型号</div></div>'+
       '<div class="fleet-kpi"><div class="fleet-kpi-label">单卡平均功耗</div><div class="fleet-kpi-value">'+powerMarkup(averagePower)+'</div><div class="fleet-kpi-note">按宿主机可见 '+totalMeasuredGpus+' 张计算</div></div>'+ 
       '<button class="fleet-kpi fault-link '+(faultMachines.length?'has-faults':'no-faults')+'" type="button" data-fault-target="fleetFaultPanel"><div class="fleet-kpi-label">故障机器</div><div class="fleet-kpi-value">'+faultMachines.length+'<small>台</small></div><div class="fleet-kpi-note">'+(faultMachines.length?'点击查看并跳转':'当前未发现故障')+'</div></button>'+
+      '<button class="fleet-kpi cpu-heat-link '+cpuState+'" type="button" data-fault-target="fleetCpuHeatPanel" aria-controls="fleetCpuHeatPanel"><div class="fleet-kpi-label">CPU 高温机器</div><div class="fleet-kpi-value">'+hotCpuMachines.length+'<small>台</small></div><div class="fleet-kpi-note">'+cpuCoverage+'</div></button>'+
     '</div>'+
     '<div class="fleet-panels"><section class="fleet-panel"><div class="fleet-panel-head"><span class="fleet-panel-title">显卡型号分布</span><span class="fleet-panel-meta">'+totalGpus+' 张</span></div><div class="fleet-model-list">'+(modelHtml||'<div class="fleet-empty">暂无显卡数据</div>')+'</div></section>'+
       '<section class="fleet-panel"><div class="fleet-panel-head"><span class="fleet-panel-title">设备功耗对比</span><span class="fleet-panel-meta">实时</span></div><div class="fleet-device-list">'+deviceHtml+'</div></section></div>'+
-    '<section class="fleet-panel fleet-fault-panel" id="fleetFaultPanel"><div class="fleet-panel-head"><span class="fleet-panel-title">故障机器</span><span class="fleet-panel-meta">'+faultMachines.length+' 台</span></div><div class="fleet-fault-list">'+(faultHtml||'<div class="fleet-empty">当前未发现显卡故障机器</div>')+'</div></section>';
+    '<section class="fleet-panel fleet-fault-panel" id="fleetFaultPanel"><div class="fleet-panel-head"><span class="fleet-panel-title">故障机器</span><span class="fleet-panel-meta">'+faultMachines.length+' 台</span></div><div class="fleet-fault-list">'+(faultHtml||'<div class="fleet-empty">当前未发现显卡故障机器</div>')+'</div></section>'+
+    '<section class="fleet-panel fleet-fault-panel" id="fleetCpuHeatPanel"><div class="fleet-panel-head"><span class="fleet-panel-title">CPU 高温机器</span><span class="fleet-panel-meta">'+hotCpuMachines.length+' 台 · ≥80°C</span></div><div class="fleet-fault-list">'+(cpuHeatHtml||'<div class="fleet-empty">'+cpuEmpty+'</div>')+'</div><div class="fleet-cpu-coverage">'+cpuCoverage+(cpuMonitored<nodes.length?' · '+(nodes.length-cpuMonitored)+' 台暂无温度数据':'')+'</div></section>';
   var newModelList=dashboard.querySelector('.fleet-model-list');
   var newDeviceList=dashboard.querySelector('.fleet-device-list');
   if(newModelList)newModelList.scrollTop=Math.min(modelScrollTop,Math.max(0,newModelList.scrollHeight-newModelList.clientHeight));
@@ -2664,6 +2810,22 @@ function pctClass(v){return v>90?'red':v>70?'yellow':'green'}
 function pctTag(v){return '<span class="tag tag-'+pctClass(v)+'">'+v.toFixed(1)+'%</span>'}
 function progress(v,c){return '<div class="progress"><div class="progress-fill fill-'+(c||pctClass(v))+'" style="width:'+Math.min(v,100)+'%"></div></div>'}
 function tempClass(t){return t>85?'temp-red':t>70?'temp-yellow':'temp-green'}
+function cpuTempClass(t){
+  if(typeof t!=='number'||!Number.isFinite(t))return 'cpu-temp-unavailable';
+  return t>88?'cpu-temp-critical':t>=80?'cpu-temp-warning':'cpu-temp-normal';
+}
+function renderCPUTemperatures(cpu){
+  var temperatures=Array.isArray(cpu.temperatures)?cpu.temperatures:[];
+  var html='<div class="cpu-temperatures"><div class="cpu-temperatures-title">CPU 温度</div>';
+  if(!temperatures.length)return html+'<div class="cpu-temperature-empty">未检测到 CPU 温度传感器</div></div>';
+  return html+temperatures.map(function(sensor){
+    var value=sensor.temperature_c,cls=cpuTempClass(value);
+    var label=cls==='cpu-temp-unavailable'?'暂不可用':value.toFixed(1)+'\u00b0C';
+    if(cls==='cpu-temp-warning')label+=' · 偏高';
+    if(cls==='cpu-temp-critical')label+=' · 高温';
+    return '<div class="cpu-temperature-row"><span>'+esc(sensor.name)+'</span><span class="cpu-temperature-value '+cls+'">'+label+'</span></div>';
+  }).join('')+'</div>';
+}
 function pcieWarn(s){return s.indexOf('\u26a0')>=0?'color:var(--yellow)':'color:var(--accent)'}
 
 function renderStatus(d){
@@ -2696,7 +2858,7 @@ function renderSystem(d){
     '<div class="stats-grid" style="grid-template-columns:repeat(2,1fr)">'+
     '<div class="stat-box"><div class="stat-label">核心 / 线程</div><div class="stat-value">'+cpu.cores+' / '+cpu.threads+'</div></div>'+
     '<div class="stat-box"><div class="stat-label">频率</div><div class="stat-value">'+cpu.freq+'</div></div>'+
-    '</div></div>'+
+    '</div>'+renderCPUTemperatures(cpu)+'</div>'+
     '<div class="card system-card memory-card"><div class="card-header"><span class="card-title">内存</span><span class="card-badge">RAM</span></div>'+
     '<div class="stats-grid" style="grid-template-columns:repeat(2,1fr)">'+
     '<div class="stat-box"><div class="stat-label">已用 / 总计</div><div class="stat-value" style="font-size:16px">'+mf.used+'</div><div class="stat-sub">'+mf.total+'</div>'+progress(mem.percent)+'</div>'+
@@ -2871,6 +3033,8 @@ collect_info() {
   HOSTNAME=$(hostname)
   CPU_MODEL=$(grep -m1 'model name' /proc/cpuinfo | sed 's/.*: //')
   CPU_CORES=$(grep -c '^processor' /proc/cpuinfo)
+  CPU_TEMPERATURES=$(python3 /opt/hw-monitor/cpu_temperature.py --tty 2>/dev/null)
+  [ -z "$CPU_TEMPERATURES" ] && CPU_TEMPERATURES="    CPU temperature unavailable"
   MEM_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
   MEM_GB=$(( MEM_KB / 1024 / 1024 ))
 
@@ -2928,6 +3092,7 @@ show_info() {
   echo "  www.baidu.com: ${BAIDU_STATUS}"
   echo ""
   echo "  CPU:    ${CPU_CORES} cores"
+  printf '%s\n' "$CPU_TEMPERATURES"
   echo "  RAM:    ${MEM_GB} GB"
   echo "  DISK:"
   echo "$(printf "    %-20s %s" "DEVICE" "SIZE")"
@@ -2988,15 +3153,18 @@ chmod 0755 ${STAGE_DIR}/tty-banner.sh
 echo "[*] Validate generated monitor files..."
 chmod 0755 ${STAGE_DIR}/gpu_health.py
 chmod 0644 ${STAGE_DIR}/server.py
-${PYTHON_BIN} -m py_compile ${STAGE_DIR}/gpu_health.py ${STAGE_DIR}/server.py
+chmod 0644 ${STAGE_DIR}/cpu_temperature.py
+bash -n ${STAGE_DIR}/tty-banner.sh
+${PYTHON_BIN} -m py_compile ${STAGE_DIR}/gpu_health.py ${STAGE_DIR}/server.py ${STAGE_DIR}/cpu_temperature.py
 ${PYTHON_BIN} ${STAGE_DIR}/gpu_health.py --self-test
 
 echo "[*] Atomically deploy monitor files..."
+DEPLOYED=1
+mv -f ${STAGE_DIR}/cpu_temperature.py ${INSTALL_DIR}/cpu_temperature.py
 mv -f ${STAGE_DIR}/gpu_health.py ${INSTALL_DIR}/gpu_health.py
 mv -f ${STAGE_DIR}/server.py ${INSTALL_DIR}/server.py
 mv -f ${STAGE_DIR}/tty-banner.sh ${INSTALL_DIR}/tty-banner.sh
 ln -sfn gpu_health.py ${INSTALL_DIR}/gpu-health.py
-DEPLOYED=1
 
 echo "[*] Create hw-monitor service..."
 cat > /etc/systemd/system/${SERVICE1}.service << EOF
